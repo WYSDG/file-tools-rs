@@ -212,6 +212,8 @@ impl HalftoneTab {
     }
 
     pub fn run(self: &Rc<Self>, app: &AppState) {
+        let live = app.live_run.get();
+        let step_params = self.base.get_preset_data();
         let Some(input) = self.base.get_input() else {
             self.base.set_status("Load an image first", true);
             return;
@@ -276,7 +278,7 @@ impl HalftoneTab {
             match result {
                 Ok(()) => {
                     base.set_status("Done.", false);
-                    app.commit_history("Halftone", out_after);
+                    app.commit_step("Halftone", out_after, step_params, live);
                 }
                 Err(e) => base.set_status(&e, true),
             }
@@ -338,6 +340,10 @@ fn render_halftone(
             if p.invert {
                 v = 255.0 - v;
             }
+            // Transparent pixels get no dot, semi-transparent ones smaller dots. (Tools like RemBg
+            // leave the original colours hidden under the transparent pixels, which used to be
+            // sampled as if they were visible.)
+            v = 255.0 - (255.0 - v) * (px[3] as f32 / 255.0);
             gray.push(v);
         }
     }
@@ -603,6 +609,26 @@ mod tests {
 
     fn has(img: &image::RgbaImage, f: impl Fn(&image::Rgba<u8>) -> bool) -> bool {
         img.pixels().any(|p| f(p))
+    }
+
+    #[test]
+    fn transparent_pixels_get_no_dots() {
+        // Left half transparent but with dark colour hidden underneath (as RemBg leaves it),
+        // right half opaque and dark.
+        let dir = std::env::temp_dir();
+        let (inp, out) = (dir.join("ht_alpha_in.png"), dir.join("ht_alpha_out.png"));
+        let mut img = image::RgbaImage::new(100, 100);
+        for (x, _, px) in img.enumerate_pixels_mut() {
+            px.0 = if x < 50 { [10, 10, 10, 0] } else { [10, 10, 10, 255] };
+        }
+        img.save(&inp).unwrap();
+        render_halftone(&inp, &out, &params("transparent", false)).unwrap();
+        let res = image::open(&out).unwrap().to_rgba8();
+        let (w, _) = res.dimensions();
+        let left_ink = res.enumerate_pixels().filter(|(x, _, p)| *x < w / 2 - 6 && p[3] > 0).count();
+        let right_ink = res.enumerate_pixels().filter(|(x, _, p)| *x > w / 2 + 6 && p[3] > 0).count();
+        assert_eq!(left_ink, 0, "no dots over the transparent half");
+        assert!(right_ink > 500, "dots over the opaque half ({right_ink})");
     }
 
     #[test]

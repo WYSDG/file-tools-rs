@@ -233,7 +233,7 @@ impl CropTab {
             let t = this.clone();
             let ac = app.clone();
             this.base
-                .set_live_trigger(Rc::new(move || t.run(&ac, true)));
+                .set_live_trigger(Rc::new(move || t.run(&ac, false)));
         }
 
         this
@@ -246,6 +246,30 @@ impl CropTab {
             self.base.set_status("Load an image first", true);
             return;
         };
+        // Nothing chosen yet? Say so instead of silently producing an identical copy.
+        let has_crop = app
+            .preview
+            .get_crop_overlay()
+            .map(|(_, _, w, h)| w > 0 && h > 0)
+            .unwrap_or(false);
+        let has_size = !self.w_entry.text().trim().is_empty() || !self.h_entry.text().trim().is_empty();
+        let has_ops = *self.rotate_quarters.borrow() != 0
+            || *self.flip_h_state.borrow()
+            || *self.flip_v_state.borrow()
+            || self.angle.value().round() as i32 != 0
+            || has_crop
+            || has_size
+            || self.do_trim.is_active();
+        if !has_ops {
+            if commit {
+                self.base.set_status(
+                    "Nothing to apply yet: drag a crop box on the image, or rotate / flip / resize / trim.",
+                    true,
+                );
+            }
+            return;
+        }
+
         let fmts = ["png", "jpg", "webp"];
         let fmt = fmts
             .get(self.fmt.selected() as usize)
@@ -320,9 +344,23 @@ impl CropTab {
             // After a successful commit, update crop's own input to the
             // result so the next drag's coordinates are in the right space.
             let base_c = self.base.clone();
+            let tc = self.clone();
+            let app_c = app.clone();
             let out_for_cb = out.clone();
             let on_complete: Option<Rc<dyn Fn()>> = Some(Rc::new(move || {
                 base_c.set_input(Some(out_for_cb.clone()), None);
+                // The result is the new input, so the pending crop box / rotation / flips /
+                // resize are already applied: clear them (re-applying them was why a second
+                // "Process" appeared to do nothing).
+                *tc.rotate_quarters.borrow_mut() = 0;
+                *tc.flip_h_state.borrow_mut() = false;
+                *tc.flip_v_state.borrow_mut() = false;
+                tc.angle.set_value(0.0);
+                tc.w_entry.set_text("");
+                tc.h_entry.set_text("");
+                app_c.preview.set_crop_overlay(None);
+                tc.crop_info
+                    .set_text("Drag on the preview to define a crop rectangle");
             }));
             self.base.clone().spawn_processing_with_callback(
                 app.clone(),

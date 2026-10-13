@@ -187,6 +187,8 @@ impl AsciiTab {
     }
 
     pub fn run(self: &Rc<Self>, app: &AppState) {
+        let live = app.live_run.get();
+        let step_params = self.base.get_preset_data();
         let Some(input) = self.base.get_input() else {
             self.base.set_status("Load an image first", true);
             return;
@@ -330,7 +332,7 @@ impl AsciiTab {
                 Ok(text) => {
                     *last_text.borrow_mut() = text;
                     base.set_status("Done.", false);
-                    app.commit_history("Ascii", out_after.clone());
+                    app.commit_step("Ascii", out_after.clone(), step_params, live);
                 }
                 Err(e) => base.set_status(&e, true),
             }

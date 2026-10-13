@@ -1,17 +1,13 @@
-//! Paperize — turns any image into a layered paper-cutout artwork.
+//! Paperize — gives any image a ripped-paper border and a weathered, grungy look.
 //!
-//! How it works
-//! 1. The image is smoothed, then reduced to N flat colours (k-means), sorted dark → light.
-//! 2. Each colour becomes one sheet of paper. Sheet `i` covers every pixel whose colour rank is >= i,
-//!    so lighter sheets sit on top of darker ones, exactly like stacked cut paper.
-//! 3. Sheet edges are blurred and wobbled with noise so they look hand-cut, not pixel-perfect.
-//! 4. Every sheet casts a soft drop shadow on the sheets below it and gets a thin highlight on its
-//!    lit edge (light comes from the top-left).
-//! 5. Optionally a paper texture is added: fibres and grain, plus "weathering" — stains,
-//!    brown age spots, yellowing, and white frayed edges — controlled by one slider.
+//! * **Torn border** (optional): either a paper border around the photo ("photo on a torn sheet")
+//!   or the tear eating into the photo's own edges. The tear is hand-ripped looking (multi-scale
+//!   noise), with a pale fibrous paper core along the rip and a soft drop shadow.
+//! * **Weathering** (one slider): fading and yellowing, stains, mottling, burnt edges, dust,
+//!   scratches and creases, all scaled together. A separate grain slider adds film/paper grain.
 //!
-//! Transparent areas of the source stay transparent (handy for cut-out subjects).
-//! Everything is rendered in Rust (no ImageMagick) so it can use the fast big-image live preview.
+//! The photo itself is never turned into layers. Rendered in Rust (no ImageMagick) so it can use the
+//! fast big-image live preview.
 
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -25,75 +21,105 @@ use crate::tabs::base::{BaseTab, RustJob};
 
 #[derive(Clone, Copy)]
 pub struct PaperParams {
-    pub layers: usize,
-    /// Pre-blur in pixels (at full resolution).
-    pub smooth: f32,
-    /// 0..1 hand-cut edge wobble.
+    /// Torn border on/off (off = weathering only).
+    pub border: bool,
+    /// 0 = paper border around the photo, 1 = the tear eats into the photo.
+    pub style: u32,
+    /// Border size as a fraction of the shorter side (0..0.25).
+    pub size: f32,
+    /// 0..1 tear roughness.
     pub rough: f32,
+    /// Width in px (full resolution) of the pale torn-paper core.
+    pub rim: f32,
     /// 0..1 shadow strength.
     pub shadow: f32,
-    /// Paper thickness = shadow offset in pixels (at full resolution).
+    /// Shadow offset in px (full resolution).
     pub thick: f32,
-    pub gray: bool,
-    pub texture: bool,
-    /// 0..1
-    pub grain: f32,
-    /// 0..1
+    /// 0 cream, 1 white, 2 kraft, 3 black.
+    pub paper: u32,
+    /// 0 transparent, 1 dark, 2 white.
+    pub bg: u32,
+    /// 0..1 weathering amount.
     pub weather: f32,
+    /// 0..1 grain.
+    pub grain: f32,
 }
 
 pub struct PaperizeTab {
     pub base: BaseTab,
-    pub layers: gtk::Scale,
-    pub smooth: gtk::Scale,
+    pub border: gtk::Switch,
+    pub style: gtk::DropDown,
+    pub size: gtk::Scale,
     pub rough: gtk::Scale,
+    pub rim: gtk::Scale,
     pub shadow: gtk::Scale,
     pub thick: gtk::Scale,
-    pub palette: gtk::DropDown,
-    pub texture: gtk::Switch,
-    pub grain: gtk::Scale,
+    pub paper: gtk::DropDown,
+    pub bg: gtk::DropDown,
     pub weather: gtk::Scale,
+    pub grain: gtk::Scale,
     pub fmt: gtk::DropDown,
 }
 
 impl PaperizeTab {
     pub fn new(app: AppState) -> Self {
-        let base = BaseTab::new("Paperize", Some("Paperize"), "Paperize (paper cutout)", app);
+        let base = BaseTab::new("Paperize", Some("Paperize"), "Paperize (torn paper + weathering)", app);
 
-        let layers = base.tracked_slider("Paper layers", 2.0, 10.0, 5.0);
-        let smooth = base.tracked_slider("Smoothing", 0.0, 20.0, 4.0);
-        let rough = base.tracked_slider("Edge roughness %", 0.0, 100.0, 35.0);
-        let shadow = base.tracked_slider("Shadow strength %", 0.0, 100.0, 55.0);
-        let thick = base.tracked_slider("Paper thickness", 1.0, 16.0, 5.0);
+        let row = |label: &str| {
+            let r = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            r.append(&gtk::Label::new(Some(label)));
+            r
+        };
 
-        let pal_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        pal_row.append(&gtk::Label::new(Some("Colors")));
-        let palette = gtk::DropDown::from_strings(&["Image colors", "Grayscale"]);
-        pal_row.append(&palette);
-        base.controls.append(&pal_row);
+        // --- torn border ---
+        let border_row = row("Torn paper border");
+        let border = gtk::Switch::new();
+        border.set_active(true);
+        border_row.append(&border);
+        base.controls.append(&border_row);
 
-        let tex_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        tex_row.append(&gtk::Label::new(Some("Paper texture")));
-        let texture = gtk::Switch::new();
-        texture.set_active(true);
-        tex_row.append(&texture);
-        base.controls.append(&tex_row);
+        let style_row = row("Style");
+        let style = gtk::DropDown::from_strings(&["Paper border", "Torn photo edges"]);
+        style_row.append(&style);
+        base.controls.append(&style_row);
 
-        let grain = base.tracked_slider("Paper grain %", 0.0, 100.0, 40.0);
-        let weather = base.tracked_slider("Weathering %", 0.0, 100.0, 25.0);
-        let tex_widgets: Vec<gtk::Widget> = base
-            .slider_widgets(&grain)
-            .into_iter()
-            .chain(base.slider_widgets(&weather))
-            .collect();
+        let size = base.tracked_slider("Border size %", 0.0, 25.0, 6.0);
+        let rough = base.tracked_slider("Tear roughness %", 0.0, 100.0, 55.0);
+        let rim = base.tracked_slider("Torn rim width", 0.0, 40.0, 10.0);
+        let shadow = base.tracked_slider("Shadow strength %", 0.0, 100.0, 45.0);
+        let thick = base.tracked_slider("Shadow depth", 1.0, 16.0, 5.0);
+
+        let paper_row = row("Paper");
+        let paper = gtk::DropDown::from_strings(&["Cream", "White", "Kraft", "Black"]);
+        paper_row.append(&paper);
+        base.controls.append(&paper_row);
+
+        let bg_row = row("Background");
+        let bg = gtk::DropDown::from_strings(&["Transparent", "Dark", "White"]);
+        bg_row.append(&bg);
+        base.controls.append(&bg_row);
+
+        // Everything that only matters when the torn border is on.
+        let mut border_widgets: Vec<gtk::Widget> = vec![
+            style_row.clone().upcast(),
+            paper_row.clone().upcast(),
+            bg_row.clone().upcast(),
+        ];
+        for s in [&size, &rough, &rim, &shadow, &thick] {
+            border_widgets.extend(base.slider_widgets(s));
+        }
         {
-            let widgets = tex_widgets.clone();
-            texture.connect_active_notify(move |s| {
+            let widgets = border_widgets.clone();
+            border.connect_active_notify(move |sw| {
                 for w in &widgets {
-                    w.set_visible(s.is_active());
+                    w.set_visible(sw.is_active());
                 }
             });
         }
+
+        // --- weathering ---
+        let weather = base.tracked_slider("Weathering %", 0.0, 100.0, 40.0);
+        let grain = base.tracked_slider("Grain %", 0.0, 100.0, 25.0);
 
         let fmt_lbl = gtk::Label::new(Some("Output format"));
         fmt_lbl.set_xalign(0.0);
@@ -101,38 +127,44 @@ impl PaperizeTab {
         let fmt = gtk::DropDown::from_strings(&["png", "jpg", "webp"]);
         base.controls.append(&fmt);
 
-        base.register_slider("layers", &layers);
-        base.register_slider("smooth", &smooth);
+        base.register_switch("border", &border);
+        base.register_dropdown("style", &style);
+        base.register_slider("size", &size);
         base.register_slider("rough", &rough);
+        base.register_slider("rim", &rim);
         base.register_slider("shadow", &shadow);
         base.register_slider("thick", &thick);
-        base.register_dropdown("palette", &palette);
-        base.register_switch("texture", &texture);
-        base.register_slider("grain", &grain);
+        base.register_dropdown("paper", &paper);
+        base.register_dropdown("bg", &bg);
         base.register_slider("weather", &weather);
+        base.register_slider("grain", &grain);
         base.register_dropdown("fmt", &fmt);
 
         {
             let b = base.clone();
-            palette.connect_selected_notify(move |_| b.schedule_live_process());
-            let b = base.clone();
-            texture.connect_active_notify(move |_| b.schedule_live_process());
+            border.connect_active_notify(move |_| b.schedule_live_process());
+            for d in [&style, &paper, &bg] {
+                let b = base.clone();
+                d.connect_selected_notify(move |_| b.schedule_live_process());
+            }
         }
 
-        Self { base, layers, smooth, rough, shadow, thick, palette, texture, grain, weather, fmt }
+        Self { base, border, style, size, rough, rim, shadow, thick, paper, bg, weather, grain, fmt }
     }
 
     fn params(&self) -> PaperParams {
         PaperParams {
-            layers: self.layers.value().round().clamp(2.0, 10.0) as usize,
-            smooth: self.smooth.value() as f32,
+            border: self.border.is_active(),
+            style: self.style.selected(),
+            size: (self.size.value() / 100.0) as f32,
             rough: (self.rough.value() / 100.0) as f32,
+            rim: self.rim.value() as f32,
             shadow: (self.shadow.value() / 100.0) as f32,
             thick: self.thick.value() as f32,
-            gray: self.palette.selected() == 1,
-            texture: self.texture.is_active(),
-            grain: (self.grain.value() / 100.0) as f32,
+            paper: self.paper.selected(),
+            bg: self.bg.selected(),
             weather: (self.weather.value() / 100.0) as f32,
+            grain: (self.grain.value() / 100.0) as f32,
         }
     }
 
@@ -211,98 +243,6 @@ fn lum(c: &[f32; 3]) -> f32 {
     0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2]
 }
 
-// ---------------------------------------------------------------------------
-// Colour reduction
-// ---------------------------------------------------------------------------
-
-fn nearest(centers: &[[f32; 3]], c: &[f32; 3]) -> usize {
-    let mut best = (f32::MAX, 0);
-    for (i, k) in centers.iter().enumerate() {
-        let d = (k[0] - c[0]).powi(2) + (k[1] - c[1]).powi(2) + (k[2] - c[2]).powi(2);
-        if d < best.0 {
-            best = (d, i);
-        }
-    }
-    best.1
-}
-
-/// k-means on a sample of the image. Result is sorted dark → light.
-fn kmeans_palette(img: &RgbaImage, k: usize) -> Vec<[f32; 3]> {
-    let total = (img.width() * img.height()) as usize;
-    let step = (total / 20_000).max(1);
-    let mut samples: Vec<[f32; 3]> = img
-        .pixels()
-        .step_by(step)
-        .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
-        .collect();
-    if samples.is_empty() {
-        return vec![[128.0; 3]; k];
-    }
-    samples.sort_by(|a, b| lum(a).partial_cmp(&lum(b)).unwrap_or(std::cmp::Ordering::Equal));
-    let mut centers: Vec<[f32; 3]> = (0..k)
-        .map(|i| samples[(((i as f32 + 0.5) / k as f32) * samples.len() as f32) as usize % samples.len()])
-        .collect();
-    for _ in 0..10 {
-        let mut sum = vec![[0f32; 3]; k];
-        let mut cnt = vec![0u32; k];
-        for s in &samples {
-            let j = nearest(&centers, s);
-            for c in 0..3 {
-                sum[j][c] += s[c];
-            }
-            cnt[j] += 1;
-        }
-        for j in 0..k {
-            if cnt[j] > 0 {
-                for c in 0..3 {
-                    centers[j][c] = sum[j][c] / cnt[j] as f32;
-                }
-            }
-        }
-    }
-    centers.sort_by(|a, b| lum(a).partial_cmp(&lum(b)).unwrap_or(std::cmp::Ordering::Equal));
-    centers
-}
-
-// ---------------------------------------------------------------------------
-// Renderer
-// ---------------------------------------------------------------------------
-
-/// Anti-aliased, wobbly coverage of one sheet plus a "frayed edge" band (for weathering).
-struct Sheet {
-    cov: Vec<f32>,
-    band: Vec<f32>,
-}
-
-fn shape_sheet(
-    mask: &GrayImage,
-    sigma: f32,
-    rough: f32,
-    wob: &[f32],
-    off: (usize, usize),
-    want_band: bool,
-) -> Sheet {
-    let (w, h) = mask.dimensions();
-    let (wu, hu) = (w as usize, h as usize);
-    let blurred = if sigma > 0.3 { image::imageops::blur(mask, sigma) } else { mask.clone() };
-    let k = (sigma * 2.5).clamp(3.0, 20.0);
-    let mut cov = vec![0f32; wu * hu];
-    let mut band = if want_band { vec![0f32; wu * hu] } else { Vec::new() };
-    for y in 0..hu {
-        let wy = (y + off.1) % hu;
-        for x in 0..wu {
-            let wx = (x + off.0) % wu;
-            let v0 = blurred.as_raw()[y * wu + x] as f32 / 255.0;
-            let v = v0 + (wob[wy * wu + wx] - 0.5) * rough * 0.9;
-            cov[y * wu + x] = ((v - 0.5) * k + 0.5).clamp(0.0, 1.0);
-            if want_band {
-                band[y * wu + x] = (1.0 - (v0 - 0.5).abs() * 5.0).clamp(0.0, 1.0);
-            }
-        }
-    }
-    Sheet { cov, band }
-}
-
 /// Blur + offset a coverage map to make a drop shadow (returns 0..1 per pixel).
 fn shadow_map(cov: &[f32], w: u32, h: u32, off: i32, sigma: f32) -> Vec<f32> {
     let (wu, hu) = (w as usize, h as usize);
@@ -323,219 +263,254 @@ fn shadow_map(cov: &[f32], w: u32, h: u32, off: i32, sigma: f32) -> Vec<f32> {
     b.as_raw().iter().map(|&v| v as f32 / 255.0).collect()
 }
 
+
+// ---------------------------------------------------------------------------
+// Renderer
+// ---------------------------------------------------------------------------
+
+fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+}
+
+fn paper_base(kind: u32) -> [f32; 3] {
+    match kind {
+        1 => [0.97, 0.97, 0.95],
+        2 => [0.72, 0.56, 0.38],
+        3 => [0.10, 0.10, 0.11],
+        _ => [0.94, 0.91, 0.83],
+    }
+}
+
 /// `scale` = size of `input` relative to the real image (pixel-valued settings are multiplied by it).
+/// The output can be larger than the input (the paper border and shadow need room).
 pub fn render_paperize(input: &Path, out: &Path, p: &PaperParams, scale: f32) -> Result<(), String> {
     let src = image::open(input).map_err(|e| e.to_string())?.to_rgba8();
     let (w, h) = src.dimensions();
-    let (wu, hu) = (w as usize, h as usize);
-    let n = p.layers.clamp(2, 10);
     let sc = scale.clamp(0.05, 1.0);
+    let min_side = w.min(h) as f32;
 
-    // --- 1. prepare colours: fill transparent areas with the average colour so blurring doesn't bleed black
-    let (mut sr, mut sg, mut sb, mut cnt) = (0f64, 0f64, 0f64, 0f64);
-    for px in src.pixels().step_by(((wu * hu) / 5000).max(1)) {
-        if px[3] > 200 {
-            sr += px[0] as f64;
-            sg += px[1] as f64;
-            sb += px[2] as f64;
-            cnt += 1.0;
-        }
-    }
-    let mean = if cnt > 0.0 { [sr / cnt, sg / cnt, sb / cnt] } else { [128.0; 3] };
-    let mut work = RgbaImage::new(w, h);
-    for (d, s) in work.pixels_mut().zip(src.pixels()) {
-        let a = s[3] as f64 / 255.0;
-        let mixc = |c: usize| (s[c] as f64 * a + mean[c] * (1.0 - a)).round() as u8;
-        let (mut r, mut g, mut b) = (mixc(0), mixc(1), mixc(2));
-        if p.gray {
-            let l = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8;
-            r = l;
-            g = l;
-            b = l;
-        }
-        d.0 = [r, g, b, 255];
-    }
-
-    // --- 2. smooth, then reduce to N colours
-    let smooth = p.smooth * sc;
-    let smoothed = if smooth > 0.3 { image::imageops::blur(&work, smooth) } else { work };
-    let palette = kmeans_palette(&smoothed, n);
-    let idx: Vec<u8> = smoothed
-        .pixels()
-        .map(|px| nearest(&palette, &[px[0] as f32, px[1] as f32, px[2] as f32]) as u8)
-        .collect();
-
-    // --- 3. noise fields shared by all sheets (coordinates in "real" pixels so preview == final)
-    let wob: Vec<f32> = (0..wu * hu)
-        .map(|i| {
-            let (x, y) = ((i % wu) as f32 / sc, (i / wu) as f32 / sc);
-            fbm(x / 11.0, y / 11.0, 2, 7)
-        })
-        .collect();
-
-    // --- 4. stack the sheets (premultiplied RGBA floats)
-    let mut canvas = vec![[0f32; 4]; wu * hu];
-    let edge_sigma = (1.2 + smooth * 0.35).max(1.0);
+    // --- geometry -------------------------------------------------------------------------
+    let size_px = if p.border { p.size * min_side } else { 0.0 };
+    let paper_style = p.style == 0;
+    // The sheet's nominal edge = the photo rectangle grown (paper border) or shrunk (torn photo edges).
+    let grow = if paper_style { size_px } else { -size_px };
+    let amp = if p.border { (p.rough * (0.30 * size_px).max(10.0 * sc)).min(0.12 * min_side) } else { 0.0 };
+    let rim = if p.border { p.rim * sc } else { 0.0 };
     let thick = (p.thick * sc).max(1.0);
-    let off = thick.round().max(1.0) as i32;
-    let hl_off = ((thick * 0.45).round() as i32).max(1);
-    let paper_white = [0.97f32, 0.95, 0.90];
+    let shadow_on = p.border && p.shadow > 0.0;
+    let pad = if p.border { amp + rim + if shadow_on { thick * 3.5 } else { 0.0 } + 4.0 } else { 0.0 };
+    let ext = (grow.max(0.0) + pad).ceil() as u32;
+    let (cw, ch) = (w + 2 * ext, h + 2 * ext);
+    let (cwu, chu) = (cw as usize, ch as usize);
+    let (ox, oy) = (ext as i32, ext as i32);
+    let (wi, hi) = (w as i32, h as i32);
 
-    for layer in 0..n {
-        let col = [palette[layer][0] / 255.0, palette[layer][1] / 255.0, palette[layer][2] / 255.0];
+    let (rx0, rx1, ry0, ry1) = if p.border {
+        (ox as f32 - grow, (ox + wi) as f32 + grow, oy as f32 - grow, (oy + hi) as f32 + grow)
+    } else {
+        (-1.0e6, 1.0e6, -1.0e6, 1.0e6)
+    };
 
-        // sheet shape
-        let sheet = if layer == 0 {
-            // base sheet = the source's own silhouette (fully opaque unless the image has transparency)
-            Sheet { cov: src.pixels().map(|px| px[3] as f32 / 255.0).collect(), band: Vec::new() }
-        } else {
-            let mut m = GrayImage::new(w, h);
-            for i in 0..wu * hu {
-                if idx[i] as usize >= layer && src.as_raw()[i * 4 + 3] > 127 {
-                    m.as_mut()[i] = 255;
-                }
+    let paper_col = paper_base(p.paper);
+    let core = [0.97f32, 0.96, 0.92]; // the pale paper core revealed by the tear
+    let wa = p.weather.clamp(0.0, 1.0);
+    let burn_len = (0.045 * min_side).max(6.0 * sc);
+
+    // --- 1. build the sheet (premultiplied RGBA) -------------------------------------------
+    let mut sheet = vec![[0f32; 4]; cwu * chu];
+    for y in 0..ch as i32 {
+        for x in 0..cw as i32 {
+            let (xf, yf) = (x as f32 + 0.5, y as f32 + 0.5);
+            let sd = (xf - rx0).min(rx1 - xf).min(yf - ry0).min(ry1 - yf);
+            let (xr, yr) = (xf / sc, yf / sc);
+
+            let near = amp > 0.0 && sd.abs() < amp * 1.6 + rim + 3.0;
+            let off = if near {
+                amp * ((fbm(xr / 70.0, yr / 70.0, 3, 41) - 0.5) * 1.6
+                    + (fbm(xr / 16.0, yr / 16.0, 2, 43) - 0.5) * 0.9
+                    + (hash2(x, y, 47) - 0.5) * 0.35)
+            } else {
+                0.0
+            };
+            let v = sd + off; // > 0 inside the torn sheet
+            let cov = smoothstep(-0.8, 0.8, v);
+            if cov <= 0.001 {
+                continue;
             }
-            let offset = ((layer * 37) % wu.max(1), (layer * 61) % hu.max(1));
-            shape_sheet(&m, edge_sigma, p.rough, &wob, offset, p.texture && p.weather > 0.0)
-        };
 
-        // drop shadow onto the sheets below
-        if layer > 0 && p.shadow > 0.0 {
-            let sh = shadow_map(&sheet.cov, w, h, off, thick * 0.9);
-            for i in 0..wu * hu {
-                if canvas[i][3] > 0.001 {
-                    let k = 1.0 - sh[i] * p.shadow * 0.75;
-                    canvas[i][0] *= k;
-                    canvas[i][1] *= k;
-                    canvas[i][2] *= k;
-                }
+            let in_photo = x >= ox && x < ox + wi && y >= oy && y < oy + hi;
+            let mut col;
+            let mut a_src = 1.0f32;
+            if in_photo {
+                let s = src.get_pixel((x - ox) as u32, (y - oy) as u32);
+                a_src = s[3] as f32 / 255.0;
+                col = [s[0] as f32 / 255.0, s[1] as f32 / 255.0, s[2] as f32 / 255.0];
+            } else {
+                col = [0.0; 3];
             }
-        }
+            if !in_photo || a_src < 1.0 {
+                // paper (with fibres), also showing through transparent parts of the photo
+                let fibers = (vnoise(xr * 0.7, yr * 0.09, 11) + vnoise(xr * 0.09, yr * 0.7, 13)) * 0.5 - 0.5;
+                let fine = hash2(x, y, 5) - 0.5;
+                let k = 1.0 + 0.12 * fibers + 0.05 * fine;
+                let pc = [paper_col[0] * k, paper_col[1] * k, paper_col[2] * k];
+                col = if in_photo { lerp3(pc, col, a_src) } else { pc };
+            }
+            // pale fibrous core along the rip
+            if rim > 0.5 && v < rim {
+                let t = (v / rim).clamp(0.0, 1.0);
+                let n = (fbm(xr / 9.0, yr / 9.0, 2, 53) - 0.5) * 0.7;
+                let m = 1.0 - smoothstep(0.0, 1.0, (t + n).clamp(0.0, 1.0));
+                col = lerp3(col, core, m);
+            }
 
-        // paint the sheet
-        for y in 0..hu {
-            for x in 0..wu {
-                let i = y * wu + x;
-                let c = sheet.cov[i];
-                if c <= 0.001 {
-                    continue;
+            // --- per-pixel weathering ---
+            if wa > 0.0 {
+                let l = 0.299 * col[0] + 0.587 * col[1] + 0.114 * col[2];
+                for c in col.iter_mut() {
+                    *c += (l - *c) * 0.30 * wa; // fade
+                    *c = 0.5 + (*c - 0.5) * (1.0 - 0.22 * wa); // flatten contrast
                 }
-                let mut rgb = col;
-                if layer > 0 {
-                    // lit top-left edge
-                    let (px, py) = (x as i32 - hl_off, y as i32 - hl_off);
-                    let behind = if px >= 0 && py >= 0 { sheet.cov[py as usize * wu + px as usize] } else { 0.0 };
-                    let hl = c * (1.0 - behind) * 0.35;
-                    for k in 0..3 {
-                        rgb[k] += (1.0 - rgb[k]) * hl;
-                    }
-                    // frayed white fibres along the cut edge
-                    if !sheet.band.is_empty() {
-                        let f = hash2(x as i32, y as i32, 99);
-                        let k = (sheet.band[i] * f * p.weather * 1.3).clamp(0.0, 1.0);
-                        for j in 0..3 {
-                            rgb[j] += (paper_white[j] - rgb[j]) * k;
-                        }
-                    }
-                }
-                let d = &mut canvas[i];
-                let inv = 1.0 - c;
-                d[0] = rgb[0] * c + d[0] * inv;
-                d[1] = rgb[1] * c + d[1] * inv;
-                d[2] = rgb[2] * c + d[2] * inv;
-                d[3] = c + d[3] * inv;
+                col = [col[0], col[1] * (1.0 - 0.035 * wa), col[2] * (1.0 - 0.11 * wa)]; // yellowing
+                let st = smoothstep(0.5, 0.88, fbm(xr / 150.0, yr / 150.0, 4, 23)) * wa * 0.75;
+                col = lerp3(col, [col[0] * 0.78, col[1] * 0.62, col[2] * 0.42], st); // stains
+                let mo = 1.0 + (fbm(xr / 22.0, yr / 22.0, 3, 29) - 0.5) * 0.22 * wa; // mottling
+                col = [col[0] * mo, col[1] * mo, col[2] * mo];
+                let edge_d = if p.border {
+                    v.max(0.0)
+                } else {
+                    (x.min(cw as i32 - 1 - x)).min(y.min(ch as i32 - 1 - y)) as f32
+                };
+                let burn = (-edge_d / burn_len).exp() * wa * 0.55; // scorched edges
+                col = [col[0] * (1.0 - burn * 0.30), col[1] * (1.0 - burn * 0.48), col[2] * (1.0 - burn * 0.70)];
+                let dark = smoothstep(0.90, 0.96, vnoise(xr * 0.9, yr * 0.9, 77)) * wa; // dust
+                let light = smoothstep(0.92, 0.97, vnoise(xr * 0.8 + 50.0, yr * 0.8, 79)) * wa;
+                col = lerp3(col, [0.10, 0.08, 0.06], dark * 0.7);
+                col = lerp3(col, [1.0, 1.0, 0.95], light * 0.5);
             }
+
+            let alpha = if in_photo { cov * (a_src.max(if p.border { 1.0 } else { 0.0 })) } else { cov };
+            let alpha = if p.border { cov } else { alpha };
+            sheet[y as usize * cwu + x as usize] = [
+                col[0].clamp(0.0, 1.0) * alpha,
+                col[1].clamp(0.0, 1.0) * alpha,
+                col[2].clamp(0.0, 1.0) * alpha,
+                alpha,
+            ];
         }
     }
 
-    // --- 5. paper texture + weathering
-    if p.texture && (p.grain > 0.0 || p.weather > 0.0) {
-        let w_amt = p.weather;
-        for y in 0..hu {
-            for x in 0..wu {
-                let i = y * wu + x;
-                if canvas[i][3] <= 0.001 {
+    // --- 2. scratches ------------------------------------------------------------------------
+    if wa > 0.05 {
+        let n = (((cwu * chu) as f32 / 1.2e5) * wa * 14.0).min(120.0) as u32;
+        for s in 0..n {
+            let sx = hash2(s as i32, 1, 61) * cw as f32;
+            let sy = hash2(s as i32, 2, 61) * ch as f32;
+            let ang = hash2(s as i32, 3, 61) * std::f32::consts::PI;
+            let len = (30.0 + hash2(s as i32, 4, 61) * 220.0) * sc;
+            let light = hash2(s as i32, 5, 61) > 0.35;
+            let strength = (0.15 + hash2(s as i32, 6, 61) * 0.35) * wa;
+            let steps = len.max(2.0) as i32;
+            for t in 0..steps {
+                let tf = t as f32;
+                let wob = (vnoise(tf * 0.05, s as f32, 83) - 0.5) * 3.0 * sc;
+                let px = (sx + ang.cos() * tf - ang.sin() * wob).round() as i32;
+                let py = (sy + ang.sin() * tf + ang.cos() * wob).round() as i32;
+                if px < 0 || py < 0 || px >= cw as i32 || py >= ch as i32 {
                     continue;
                 }
-                let (xr, yr) = (x as f32 / sc, y as f32 / sc);
-                let mut m = 1.0f32;
-                if p.grain > 0.0 {
-                    let fine = hash2(x as i32, y as i32, 5) - 0.5;
-                    let fibers = (vnoise(xr * 0.7, yr * 0.09, 11) + vnoise(xr * 0.09, yr * 0.7, 13)) * 0.5 - 0.5;
-                    let cloud = fbm(xr / 60.0, yr / 60.0, 3, 17) - 0.5;
-                    m += p.grain * (0.16 * fine + 0.30 * fibers + 0.22 * cloud);
+                let c = &mut sheet[py as usize * cwu + px as usize];
+                if c[3] < 0.9 {
+                    continue;
                 }
-                let mut tint = [1.0f32; 3];
-                if w_amt > 0.0 {
-                    // stains
-                    let s = smoothstep(0.45, 0.85, fbm(xr / 160.0, yr / 160.0, 4, 23)) * w_amt * 0.6;
-                    let sepia = [0.80f32, 0.64, 0.42];
-                    for k in 0..3 {
-                        tint[k] = 1.0 + (sepia[k] - 1.0) * s;
-                    }
-                    // overall yellowing
-                    let y_t = [1.0f32, 0.965, 0.89];
-                    for k in 0..3 {
-                        tint[k] *= 1.0 + (y_t[k] - 1.0) * w_amt * 0.7;
-                    }
-                }
+                let taper = (std::f32::consts::PI * tf / steps as f32).sin();
+                let a = strength * taper;
                 for k in 0..3 {
-                    canvas[i][k] *= m * tint[k];
+                    c[k] = if light { c[k] + (1.0 - c[k]) * a } else { c[k] * (1.0 - a) };
                 }
             }
         }
-        // brown age spots ("foxing")
-        if w_amt > 0.0 {
-            let count = (((wu * hu) as f32 / 30_000.0) * w_amt * 1.5).min(300.0) as u32;
-            for s in 0..count {
-                let cx = (hash2(s as i32, 1, 31) * w as f32) as i32;
-                let cy = (hash2(s as i32, 2, 31) * h as f32) as i32;
-                let r = ((2.0 + hash2(s as i32, 3, 31) * 8.0) * sc).max(1.5);
-                let strength = 0.15 + hash2(s as i32, 4, 31) * 0.3 * w_amt;
-                let ri = r.ceil() as i32 * 2;
-                for dy in -ri..=ri {
-                    for dx in -ri..=ri {
-                        let (x, y) = (cx + dx, cy + dy);
-                        if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
-                            continue;
-                        }
-                        let d2 = (dx * dx + dy * dy) as f32 / (r * r);
-                        let a = (-d2 * 1.4).exp() * strength;
-                        if a < 0.01 {
-                            continue;
-                        }
-                        let c = &mut canvas[y as usize * wu + x as usize];
-                        if c[3] <= 0.001 {
-                            continue;
-                        }
-                        c[0] *= 1.0 - a * 0.45;
-                        c[1] *= 1.0 - a * 0.65;
-                        c[2] *= 1.0 - a * 0.85;
+    }
+
+    // --- 3. creases (two soft fold lines) ----------------------------------------------------
+    if wa > 0.35 {
+        let amt = (wa - 0.2) * 0.2;
+        for f in 0..2 {
+            let px = (0.25 + hash2(f, 1, 67) * 0.5) * cw as f32;
+            let py = (0.25 + hash2(f, 2, 67) * 0.5) * ch as f32;
+            let ang = hash2(f, 3, 67) * std::f32::consts::PI;
+            let (sn, cs) = (ang.sin(), ang.cos());
+            for y in 0..chu {
+                for x in 0..cwu {
+                    let c = &mut sheet[y * cwu + x];
+                    if c[3] < 0.9 {
+                        continue;
+                    }
+                    let d = (x as f32 - px) * sn - (y as f32 - py) * cs;
+                    let dark = (-(d / (1.3 * sc.max(0.5))).powi(2)).exp() * amt;
+                    let lite = (-((d - 2.6 * sc.max(0.5)) / (1.6 * sc.max(0.5))).powi(2)).exp() * amt * 0.8;
+                    for k in 0..3 {
+                        c[k] = (c[k] * (1.0 - dark) + (1.0 - c[k]) * lite).clamp(0.0, 1.0);
                     }
                 }
             }
         }
     }
 
-    // --- 6. un-premultiply and save
-    let mut result = RgbaImage::new(w, h);
-    for (d, c) in result.pixels_mut().zip(canvas.iter()) {
-        let a = c[3].clamp(0.0, 1.0);
-        let un = |v: f32| if a > 0.001 { ((v / a).clamp(0.0, 1.0) * 255.0).round() as u8 } else { 0 };
-        d.0 = [un(c[0]), un(c[1]), un(c[2]), (a * 255.0).round() as u8];
+    // --- 4. grain -----------------------------------------------------------------------------
+    if p.grain > 0.0 {
+        for (i, c) in sheet.iter_mut().enumerate() {
+            if c[3] < 0.01 {
+                continue;
+            }
+            let (x, y) = ((i % cwu) as i32, (i / cwu) as i32);
+            let n = 1.0 + (hash2(x, y, 5) - 0.5) * 0.18 * p.grain;
+            c[0] *= n;
+            c[1] *= n;
+            c[2] *= n;
+        }
     }
+
+    // --- 5. shadow + background, then un-premultiply -----------------------------------------
+    let alpha_map: Vec<f32> = sheet.iter().map(|c| c[3]).collect();
+    let sh = if shadow_on {
+        shadow_map(&alpha_map, cw, ch, thick.round().max(1.0) as i32, thick * 1.1)
+    } else {
+        vec![0.0; cwu * chu]
+    };
+    let bg_col: Option<[f32; 3]> = match p.bg {
+        1 => Some([0.09, 0.09, 0.10]),
+        2 => Some([0.96, 0.96, 0.96]),
+        _ => None,
+    };
+    let mut result = RgbaImage::new(cw, ch);
+    for (i, d) in result.pixels_mut().enumerate() {
+        let s = sheet[i];
+        let sa = (sh[i] * p.shadow * 0.75).clamp(0.0, 1.0);
+        // layer below the sheet (premultiplied)
+        let below = match bg_col {
+            Some(b) => [b[0] * (1.0 - sa), b[1] * (1.0 - sa), b[2] * (1.0 - sa), 1.0],
+            None => [0.0, 0.0, 0.0, sa],
+        };
+        let inv = 1.0 - s[3];
+        let pr = [s[0] + below[0] * inv, s[1] + below[1] * inv, s[2] + below[2] * inv, s[3] + below[3] * inv];
+        let a = pr[3].clamp(0.0, 1.0);
+        let un = |v: f32| if a > 0.001 { ((v / a).clamp(0.0, 1.0) * 255.0).round() as u8 } else { 0 };
+        d.0 = [un(pr[0]), un(pr[1]), un(pr[2]), (a * 255.0).round() as u8];
+    }
+
     let is_jpg = out
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .map(|e| e == "jpg" || e == "jpeg")
         .unwrap_or(false);
     if is_jpg {
-        // JPEG has no transparency: flatten onto paper white.
-        let mut flat = image::RgbImage::new(w, h);
+        // JPEG has no transparency: flatten onto white.
+        let mut flat = image::RgbImage::new(cw, ch);
         for (d, s) in flat.pixels_mut().zip(result.pixels()) {
             let a = s[3] as f32 / 255.0;
-            let f = |c: u8, bg: f32| (c as f32 * a + bg * 255.0 * (1.0 - a)).round() as u8;
-            d.0 = [f(s[0], paper_white[0]), f(s[1], paper_white[1]), f(s[2], paper_white[2])];
+            let f = |c: u8| (c as f32 * a + 245.0 * (1.0 - a)).round() as u8;
+            d.0 = [f(s[0]), f(s[1]), f(s[2])];
         }
         flat.save(out).map_err(|e| e.to_string())
     } else {
@@ -549,79 +524,74 @@ mod tests {
 
     fn params() -> PaperParams {
         PaperParams {
-            layers: 4,
-            smooth: 2.0,
-            rough: 0.3,
-            shadow: 0.6,
+            border: true,
+            style: 0,
+            size: 0.10,
+            rough: 0.5,
+            rim: 8.0,
+            shadow: 0.5,
             thick: 4.0,
-            gray: false,
-            texture: false,
-            grain: 0.0,
+            paper: 0,
+            bg: 0,
             weather: 0.0,
+            grain: 0.0,
         }
     }
 
-    /// Left-to-right gradient on an opaque canvas.
-    fn gradient(path: &Path) {
-        let mut img = RgbaImage::new(200, 120);
-        for (x, _, px) in img.enumerate_pixels_mut() {
-            let v = (x as f32 / 199.0 * 255.0) as u8;
-            px.0 = [v, 255 - v, 128, 255];
-        }
-        img.save(path).unwrap();
-    }
-
-    /// Share of all pixels covered by the `k` most common (coarsely quantised) colours.
-    fn top_coverage(img: &RgbaImage, k: usize) -> f32 {
-        let mut hist = std::collections::HashMap::new();
-        for px in img.pixels() {
-            *hist.entry((px[0] / 8, px[1] / 8, px[2] / 8)).or_insert(0u32) += 1;
-        }
-        let mut counts: Vec<u32> = hist.values().copied().collect();
-        counts.sort_unstable_by(|a, b| b.cmp(a));
-        counts.iter().take(k).sum::<u32>() as f32 / (img.width() * img.height()) as f32
+    fn solid(path: &Path, w: u32, h: u32) {
+        RgbaImage::from_pixel(w, h, image::Rgba([30, 120, 200, 255])).save(path).unwrap();
     }
 
     #[test]
-    fn paperize_makes_flat_layers_with_shadows_and_keeps_size() {
+    fn paper_border_grows_the_canvas_and_surrounds_the_photo_with_paper() {
         let dir = std::env::temp_dir();
-        let (inp, out) = (dir.join("pz_in.png"), dir.join("pz_out.png"));
-        gradient(&inp);
+        let (inp, out) = (dir.join("pz2_in.png"), dir.join("pz2_out.png"));
+        solid(&inp, 200, 150);
         render_paperize(&inp, &out, &params(), 1.0).unwrap();
         let res = image::open(&out).unwrap().to_rgba8();
-        assert_eq!(res.dimensions(), (200, 120));
-        // flat sheets: a handful of colours must cover most of the picture (a smooth gradient never does)
-        let src_cov = top_coverage(&image::open(&inp).unwrap().to_rgba8(), 8);
-        let res_cov = top_coverage(&res, 8);
-        assert!(res_cov > 0.5 && res_cov > src_cov * 2.0, "flat sheets expected: {res_cov} vs source {src_cov}");
-        // still fully opaque
-        assert!(res.pixels().all(|p| p[3] == 255));
+        let (cw, ch) = res.dimensions();
+        assert!(cw > 200 && ch > 150, "canvas must grow, got {cw}x{ch}");
+        assert_eq!(res.get_pixel(0, 0)[3], 0, "far outside the paper is transparent");
+        let c = res.get_pixel(cw / 2, ch / 2);
+        assert!(c[3] == 255 && c[2] > 150 && c[0] < 80, "photo intact in the middle: {c:?}");
+        // halfway into the border zone on the left: cream paper, not photo blue
+        let ext = (cw - 200) / 2;
+        let b = res.get_pixel(ext - 7, ch / 2);
+        assert!(b[3] == 255 && b[0] > 180 && b[1] > 170 && b[2] > 120, "paper border expected, got {b:?}");
     }
 
     #[test]
-    fn paperize_keeps_transparency_and_texture_changes_pixels() {
+    fn torn_photo_edges_eat_into_the_photo() {
         let dir = std::env::temp_dir();
-        let (inp, a, b) = (dir.join("pz_t_in.png"), dir.join("pz_t_a.png"), dir.join("pz_t_b.png"));
-        let mut img = RgbaImage::new(160, 160);
-        for (x, y, px) in img.enumerate_pixels_mut() {
-            let inside = (x as i32 - 80).pow(2) + (y as i32 - 80).pow(2) < 50 * 50;
-            px.0 = if inside { [200, 60, 60, 255] } else { [0, 0, 0, 0] };
-        }
-        img.save(&inp).unwrap();
-
+        let (inp, out) = (dir.join("pz3_in.png"), dir.join("pz3_out.png"));
+        solid(&inp, 200, 150);
         let mut p = params();
-        render_paperize(&inp, &a, &p, 1.0).unwrap();
-        let plain = image::open(&a).unwrap().to_rgba8();
-        assert_eq!(plain.get_pixel(2, 2)[3], 0, "outside the subject stays transparent");
-        assert_eq!(plain.get_pixel(80, 80)[3], 255);
+        p.style = 1;
+        render_paperize(&inp, &out, &p, 1.0).unwrap();
+        let res = image::open(&out).unwrap().to_rgba8();
+        let (cw, ch) = res.dimensions();
+        let ext = (cw - 200) / 2;
+        // the photo's own left edge has been torn away, but the middle survives
+        assert!(res.get_pixel(ext + 1, ch / 2)[3] < 80, "edge should be torn off");
+        let c = res.get_pixel(cw / 2, ch / 2);
+        assert!(c[3] == 255 && c[2] > 150, "middle intact");
+    }
 
-        p.texture = true;
-        p.grain = 0.8;
-        p.weather = 0.8;
+    #[test]
+    fn weathering_changes_colours_but_not_the_shape() {
+        let dir = std::env::temp_dir();
+        let (inp, a, b) = (dir.join("pz4_in.png"), dir.join("pz4_a.png"), dir.join("pz4_b.png"));
+        solid(&inp, 160, 120);
+        let mut p = params();
+        p.border = false;
+        render_paperize(&inp, &a, &p, 1.0).unwrap();
+        p.weather = 0.9;
         render_paperize(&inp, &b, &p, 1.0).unwrap();
-        let tex = image::open(&b).unwrap().to_rgba8();
-        let differing = plain.pixels().zip(tex.pixels()).filter(|(x, y)| x != y).count();
-        assert!(differing > 2000, "texture/weathering should visibly change the image ({differing})");
+        let (ia, ib) = (image::open(&a).unwrap().to_rgba8(), image::open(&b).unwrap().to_rgba8());
+        assert_eq!(ia.dimensions(), (160, 120), "no border: same size");
+        assert!(ia.pixels().zip(ib.pixels()).all(|(x, y)| x[3] == y[3]), "alpha unchanged");
+        let diff = ia.pixels().zip(ib.pixels()).filter(|(x, y)| x != y).count();
+        assert!(diff > 160 * 120 / 2, "weathering should visibly change the photo ({diff})");
     }
 }
 
@@ -629,7 +599,7 @@ mod tests {
 mod perf {
     use super::*;
 
-    /// Manual timing check: `cargo test --release paperize_timing -- --ignored --nocapture`
+    /// Manual timing check: `cargo test paperize_timing -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn paperize_timing() {
@@ -643,8 +613,8 @@ mod perf {
             img.save(&big).unwrap();
         }
         let p = PaperParams {
-            layers: 5, smooth: 4.0, rough: 0.35, shadow: 0.55, thick: 5.0,
-            gray: false, texture: true, grain: 0.4, weather: 0.25,
+            border: true, style: 0, size: 0.06, rough: 0.55, rim: 10.0, shadow: 0.45, thick: 5.0,
+            paper: 0, bg: 0, weather: 0.4, grain: 0.25,
         };
         let (proxy, scale) = crate::util::preview_proxy(&big).unwrap();
         let t = std::time::Instant::now();
@@ -653,5 +623,21 @@ mod perf {
         let t = std::time::Instant::now();
         render_paperize(&big, &dir.join("pz_perf_b.png"), &p, 1.0).unwrap();
         println!("FULL    (3200x2000): {:?}", t.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod samples {
+    use super::*;
+
+    /// Writes sample renders for eyeballing: `cargo test paperize_samples -- --ignored`
+    #[test]
+    #[ignore]
+    fn paperize_samples() {
+        let p = PaperParams {
+            border: true, style: 1, size: 0.05, rough: 0.8, rim: 14.0, shadow: 0.5, thick: 6.0,
+            paper: 0, bg: 1, weather: 0.85, grain: 0.35,
+        };
+        render_paperize(Path::new("/tmp/landscape.png"), Path::new("/tmp/pz_style_b.png"), &p, 1.0).unwrap();
     }
 }

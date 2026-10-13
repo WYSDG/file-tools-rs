@@ -84,38 +84,50 @@ Unit tests (5): `surface_from_rgba`, `image_base_modes`, `ascii_layer_matches_im
   `magick` for formats `image` can't read (heic, svg, psd…).
 
 ## 5. Status
-**Done (v1→v7):** Rust port; pipeline + history + undo/redo; live preview; tab organiser; 3→5 themes;
+**Done (v1→v8):** Rust port; pipeline + history + undo/redo; live preview; tab organiser; 3→5 themes;
 settings popover fixes; faster image loading; dev-profile optimisation; dropped-update fix; ASCII font via
 fontconfig; launcher + icon + `install.sh`; CLI file open; transparent checkerboard in mask preview;
 CPU-capped build scripts; screenshot tool; halftone/ASCII image-base overlay, ASCII un-stretch, sound moved to Settings, theme rename + monochrome accents,
-proxy live preview for Adjust + Fill (engine step 1), orange "modified" sliders, readable switches, rail icons, canvas checkerboard behind transparency, Paperize tool.
+proxy live preview for Adjust + Fill (engine step 1), orange "modified" sliders, readable switches, rail icons, canvas checkerboard behind transparency, Paperize (v8: torn-paper border + weathering), step records (tool params) in history, undo fixes, Crop commit fix, transparency-aware Halftone.
 
 **Ideas for Paperize v2:** seed/"shuffle" for the wobble + stains, paper colour/tint picker, cast shadow direction, per-layer colour override, embossed paper fibre relief, torn-edge mode, SVG/layered export.
 
 **Open/unknown:** owner hasn't run the full test checklist; Wayland popup fix unverified on real hardware;
 `next_page` unused-assignment warning in `app.rs` (harmless).
 
-## 6. Roadmap (in priority order — reasoning included)
-1. ~~Halftone/ASCII overlay mode~~ **DONE in v4.** Halftone & ASCII share the same base options: None (transparent) / Black & white / Pure black / Original image
-   (+ White; halftone also Custom colour), "Image opacity %" for the two image bases, halftone "Dots use image colors". *Not done:* per-glyph colour in ASCII
-   (needs coloured text rendering), brightness/contrast applied to the base layer.
-2. **Engine (IN PROGRESS — step 1 done: proxy preview + deferred commit for Adjust, see §4).** Remaining: convert duotone/fillbg/gradient;
-   then in-memory images.
-   *Original plan:* keep images in memory as RGBA buffers
-   (`Document`/`Layer`), port cheap per-pixel effects (adjust, duotone, fill, gradient, pixelate, vignette) to
-   pure Rust `fn(&RgbaImage,&Params)->RgbaImage`, split **preview (downscaled proxy, e.g. ≤1280px) from commit
-   (full-res)**, "latest wins" job scheduling. Keep `magick`/rembg only for heavy work. Pixel-valued params
-   (blur radius, outline px, pixelate block) must be scaled by the proxy factor.
-3. **UI revamp (paint.net/Photoshop-like)** — *step 1 done in v6: icons on the tool rail.* Remaining: status bar, tool-options bar, dock panels, toolbox/effects split. Plan: menu bar + tool-options bar, left toolbox, canvas with checkerboard,
-   right dock panels (History, Layers, Colors, Properties), status bar (zoom, size, cursor xy). Split *tools*
-   (crop, mask brush, eyedropper, watermark) from *effects/adjustments* (menu → inspector).
-   **Icons:** bundle an MIT/ISC SVG set (Lucide or Tabler) in the binary, tint to theme colour in code;
-   do not rely on the system icon theme or emoji (that is why earlier attempts failed). Keep short labels + tooltips.
-4. **Recipes + batch:** save a whole pipeline as a recipe, run it on a folder. Drag-and-drop files onto the window.
-5. **Packaging:** `install.sh` + `.desktop` exist (personal use). AppImage not needed.
-6. **Pixel editing (long-term):** layers, brush/eraser, selections (marquee/lasso/wand), transforms, undo by pixel diffs,
-   OpenRaster (.ora) project format. Scope target = "paint.net-lite", not Krita/GIMP. Needs step 2 first.
-7. **Battery/CPU:** process only on change, no idle redraws, lower thread priority, in-process effects (no subprocess churn).
+## 6. Roadmap (agreed with the owner — in order; each round = one zip the owner tests)
+**Why this order:** history/undo, projects, recents and recipes all need "every step recorded with its tool + settings".
+Do that foundation first, then build the new UI on top of it (otherwise the UI would be rebuilt twice).
+
+1. **Foundation — DONE in v8.** Transparency-aware tools (Halftone fixed; ASCII already blank on transparent; Duotone keeps alpha;
+   *verify Pixelate/Outline/Watermark with RemBg output*), working Ctrl+Z/Ctrl+Shift+Z, `HistoryEntry{label, output_path, params, live}`
+   (params = `BaseTab::get_preset_data()` JSON), Crop "Process does nothing" bug fixed.
+   History semantics: consecutive *live* runs of one tool collapse into one step; explicit Process clicks always add a step;
+   Ctrl+Z with an un-finalised live preview cancels the preview first.
+2. **Paperize v2 — DONE in v8.** Torn-paper border (paper border / torn photo edges) + weathering/grunge slider + grain. No layer conversion.
+3. **UI shell part 1:** paint.net-style menu bar, big-button toolbar (Open, Save, Undo, Redo, Copy, Paste, zoom), tool-options bar, status bar
+   (zoom, image size, cursor xy). Keep large buttons + icons.
+4. **UI shell part 2:** tools as **category blocks** (Isolate/Adjust/Color/Effects/Style/Utility…) of large icon buttons; drag to reorder blocks
+   and tools (also between blocks); "Customize" mode to hide tools; Find-tool box + pinned favourites. Replaces the per-tab toggles.
+   Right docks: Tool settings + **History as a Photoshop/paint.net-style rollback list** (click a step to go back; later steps stay for redo).
+   Clicking a step can restore that tool's controls from `params`.
+5. **Files:** rename the old "History" strip to *Recent files*; **Projects** = folders. Save As asks: default folder / existing project / new project.
+   **Project file** (e.g. `.ftproj`, a zip like paint.net's own format): original image, ordered steps (tool + params), thumbnail, result.
+   Reopening restores the steps so they can be rolled back/edited. Reuses the preset (params) mechanism.
+6. **AI masking (proper, not an eraser):** AI proposes a mask (rembg) → user paints **Keep** / **Remove** hints on the canvas that *guide* the AI
+   (alpha matting with a trimap built from AI mask + hints) → editable mask overlay (invert, grow/shrink, feather) → apply as:
+   remove background / keep subject / blur background / crop to subject. The plain eraser stays as a separate, clearly named tool.
+   Possible later: SAM point/box prompts via `rembg -m sam -x` (large model download); object *inpainting* (separate tool, big model).
+7. **Recipes + batch + drag-and-drop**, then owner's final testing pass.
+8. **PDF workspace** (after the UI/projects work — it is a different document model, pages not an image): page grid/page view, select pages,
+   delete / extract / reorder (drag) / merge / split / rotate; "replace or load alongside?" prompt when loading another PDF; batch load.
+   Implement with `qpdf` (page ops) + `pdftoppm` (thumbnails) — both already runtime deps. Worth-adding extras, in priority order:
+   images→PDF and PDF→images, compress (ghostscript), protect/unlock (qpdf), page numbers/watermark (qpdf overlay), OCR (tesseract), metadata strip (exiftool).
+   Should share the toolbar, Recent files and Projects with the image workspace.
+9. **Engine (ongoing):** in-memory images, more tabs on the proxy preview, pixel editing/layers (long-term, "paint.net-lite").
+10. **Battery/CPU:** process only on change, no idle redraws, lower thread priority.
+
+**Ideas for Paperize v3:** seed/"shuffle" for tear + stains, per-edge control, corner folds, tape/pins, custom paper colour.
 
 ## 7. Decisions & non-goals
 - Stay on GTK4 (Wayland-native, already invested); keep the engine independent of UI so a UI swap stays possible.
@@ -136,6 +148,9 @@ proxy live preview for Adjust + Fill (engine step 1), orange "modified" sliders,
 - **v3** — theme system rewrite (palette, light/dark scheme, named-colour overrides, OLED grid), popover closing,
   transparent preview checkerboard, CLI open, `Open With` desktop entry.
 - **v2** — OLED/black themes, dev opt-level, dropped live updates fixed, in-memory image load, ASCII font fix, launcher.
+- **v8** — Paperize rewritten (torn paper border, 2 styles, rim, shadow, paper/background choice, weathering: fade/yellow/stains/mottling/burn/dust/scratches/creases, grain);
+  history entries now carry `params` + `live`; explicit Process = new step, live runs collapse; `AppState::undo()` cancels a pending preview first and ignores Ctrl+Z while typing in a text field;
+  Crop: live trigger was committing (now preview-only), state cleared after commit, "nothing to apply" message; Halftone ignores transparent pixels (RemBg leaves colours under alpha).
 - **v7** — **Paperize** tool + `run_live_rust`/`spawn_work`; canvas checkerboard for transparent areas (fixes "halftone disappears" — black dots on a black
   canvas); accent-button label colour fix (Process text was unreadable on black/dark).
 - **v6** — modified sliders turn orange (`Palette.modified`), switch knob contrast, hard-coded GTK blue on slider/progress/suggested-action overridden,

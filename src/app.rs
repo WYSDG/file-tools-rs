@@ -69,6 +69,11 @@ const FADE_TABS: &[&str] = &["Remove", "Adjust", "Duotone", "Pixelate", "Paperiz
 pub struct HistoryEntry {
     pub label: String,
     pub output_path: PathBuf,
+    /// The tool's control values when this step was produced (same format as presets).
+    pub params: serde_json::Value,
+    /// Produced by a live-preview run. Consecutive live runs of the same tool collapse into one
+    /// step; explicit "Process" clicks always start a new step.
+    pub live: bool,
 }
 
 #[derive(Clone)]
@@ -97,6 +102,8 @@ pub struct AppState {
     pub pending_commit: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     /// Bumped whenever pending work is finalized or dropped, so late preview results are ignored.
     pub live_gen: Rc<std::cell::Cell<u64>>,
+    /// True while a live-preview trigger is running (so commits can be tagged as live).
+    pub live_run: Rc<std::cell::Cell<bool>>,
 }
 
 impl AppState {
@@ -236,23 +243,34 @@ impl AppState {
         }
     }
 
+    /// Commit a step without recorded settings (explicit action).
     pub fn commit_history(&self, label: &str, output: PathBuf) {
+        self.commit_step(label, output, serde_json::Value::Null, false);
+    }
+
+    /// Commit a step with the tool's settings. `live` = produced by a live-preview run: such a step
+    /// is replaced by the next live/explicit run of the same tool; explicit steps are never replaced.
+    pub fn commit_step(&self, label: &str, output: PathBuf, params: serde_json::Value, live: bool) {
         self.drop_pending();
-        let same_tool = self
+        let replace = self
             .history
             .borrow()
             .last()
-            .map(|e| e.label == label)
+            .map(|e| e.label == label && e.live)
             .unwrap_or(false);
 
-        if same_tool {
+        if replace {
             if let Some(last) = self.history.borrow_mut().last_mut() {
                 last.output_path = output.clone();
+                last.params = params;
+                last.live = live;
             }
         } else {
             self.history.borrow_mut().push(HistoryEntry {
                 label: label.to_string(),
                 output_path: output.clone(),
+                params,
+                live,
             });
         }
         self.redo_stack.borrow_mut().clear();
@@ -292,6 +310,39 @@ impl AppState {
 
         self.broadcast_input(Some(output), true);
         self.refresh_strip();
+    }
+
+    /// Ctrl+Z. A pending (not yet finalized) live preview is cancelled first; otherwise the
+    /// last step is undone.
+    pub fn undo(&self) {
+        if self.pending_commit.borrow().is_some() {
+            self.drop_pending();
+            self.show_head();
+            return;
+        }
+        let len = self.history.borrow().len() as isize;
+        if len > 0 {
+            self.rewind_to(len - 2);
+        }
+    }
+
+    /// Show the committed state (last step, or the original) in the canvas.
+    fn show_head(&self) {
+        let head = self.history.borrow().last().map(|e| e.output_path.clone());
+        match head {
+            Some(h) => {
+                if let Some(p) = self.current_fade_original() {
+                    self.preview.set_original(&p);
+                }
+                self.preview.set_result(&h);
+            }
+            None => {
+                if let Some(p) = self.initial_load.borrow().clone() {
+                    self.preview.set_original(&p);
+                }
+                self.preview.clear_result();
+            }
+        }
     }
 
     pub fn rewind_to(&self, idx: isize) {
@@ -684,6 +735,7 @@ fn build_ui(app: &Application) {
         active_tab_name: Rc::new(RefCell::new("Remove".to_string())),
         pending_commit: Rc::new(RefCell::new(None)),
         live_gen: Rc::new(std::cell::Cell::new(0)),
+        live_run: Rc::new(std::cell::Cell::new(false)),
         history_list: Rc::new(RefCell::new(None)),
         fade_box: Rc::new(RefCell::new(None)),
         fade_slider: Rc::new(RefCell::new(None)),
@@ -1458,7 +1510,7 @@ fn build_ui(app: &Application) {
     key_ctrl.set_propagation_phase(gtk::PropagationPhase::Capture);
     {
         let state = app_state.clone();
-        key_ctrl.connect_key_pressed(move |_, keyval, _, modifiers| {
+        key_ctrl.connect_key_pressed(move |kc, keyval, _, modifiers| {
             use gtk::gdk::ModifierType;
             let ctrl = modifiers.contains(ModifierType::CONTROL_MASK);
             let shift = modifiers.contains(ModifierType::SHIFT_MASK);
@@ -1477,14 +1529,21 @@ fn build_ui(app: &Application) {
             if ctrl && !state.preview.is_eyedropper_active() {
                 let is_z = keyval == gtk::gdk::Key::z || keyval == gtk::gdk::Key::Z;
                 let is_y = keyval == gtk::gdk::Key::y || keyval == gtk::gdk::Key::Y;
+                // While typing in a text field, Ctrl+Z/Y belong to the text field.
+                let typing = kc
+                    .widget()
+                    .and_then(|w| w.root())
+                    .and_then(|r| r.focus())
+                    .map(|f| f.is::<gtk::Text>() || f.is::<gtk::TextView>())
+                    .unwrap_or(false);
+                if (is_z || is_y) && typing {
+                    return gtk::glib::Propagation::Proceed;
+                }
                 if is_z {
                     if shift {
                         state.redo();
                     } else {
-                        let len = state.history.borrow().len() as isize;
-                        if len > 0 {
-                            state.rewind_to(len - 2);
-                        }
+                        state.undo();
                     }
                     return gtk::glib::Propagation::Stop;
                 }

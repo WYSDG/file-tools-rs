@@ -91,6 +91,8 @@ impl DuotoneTab {
     }
 
     pub fn run(self: &Rc<Self>, app: &AppState) {
+        let live = app.live_run.get();
+        let step_params = self.base.get_preset_data();
         let Some(input) = self.base.get_input() else {
             self.base.set_status("Load an image first", true);
             return;
@@ -148,7 +150,7 @@ impl DuotoneTab {
             match result {
                 Ok(()) => {
                     base.set_status("Done.", false);
-                    app.commit_history("Duotone", out_after.clone());
+                    app.commit_step("Duotone", out_after.clone(), step_params, live);
                 }
                 Err(e) => base.set_status(&e, true),
             }

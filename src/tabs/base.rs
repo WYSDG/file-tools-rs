@@ -383,7 +383,13 @@ impl BaseTab {
         self.live_delay_ms.set(delay_ms);
     }
     pub fn set_live_trigger(&self, f: Rc<dyn Fn()>) {
-        *self.live_trigger.borrow_mut() = Some(f);
+        // Tag everything started by the trigger as "live" (see `AppState::commit_step`).
+        let app = self.app.clone();
+        *self.live_trigger.borrow_mut() = Some(Rc::new(move || {
+            app.live_run.set(true);
+            f();
+            app.live_run.set(false);
+        }));
     }
     pub fn schedule_live_process(&self) {
         Self::schedule_impl(
@@ -490,7 +496,7 @@ impl BaseTab {
                         }
                     }
                     base.set_status("Done.", false);
-                    app2.commit_history(&base.action_name, out);
+                    app2.commit_step(&base.action_name, out, base.get_preset_data(), true);
                 }));
             }
         }
@@ -526,7 +532,7 @@ impl BaseTab {
                     match job(&input, 1.0) {
                         Ok(out) => {
                             base.set_status("Done.", false);
-                            app2.commit_history(&base.action_name, out);
+                            app2.commit_step(&base.action_name, out, base.get_preset_data(), true);
                         }
                         Err(e) => base.set_status(&e, true),
                     }
@@ -669,6 +675,8 @@ impl BaseTab {
         commit: bool,
     ) {
         let gen = app.live_gen.get();
+        let live = app.live_run.get();
+        let step_params = self.get_preset_data();
         self.set_status("Processing… 0s", false);
         self.go.set_sensitive(false);
         self.spinner.set_visible(true);
@@ -708,7 +716,7 @@ impl BaseTab {
                     base.set_status("Done.", false);
                     if commit {
                         let label = base.action_name.clone();
-                        app.commit_history(&label, out_path);
+                        app.commit_step(&label, out_path, step_params, live);
                         if let Some(cb) = on_complete {
                             cb();
                         }

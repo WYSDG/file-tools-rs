@@ -1,0 +1,28 @@
+[package]
+name = "file-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk4 = { version = "0.9", features = ["v4_12"] }
+gio = "0.20"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+glib = "0.20"
+cairo-rs = { version = "0.20", features = ["png"] }
+image = "0.25"
+
+[profile.release]
+# "thin" LTO builds far faster and cooler than full LTO, with nearly the same speed.
+lto = "thin"
+opt-level = 3
+
+# Debug builds (cargo run) were running the image/cairo loops unoptimized,
+# which is very slow for pixel work. Optimize dependencies, keep our code fast to compile.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

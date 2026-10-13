@@ -1,0 +1,4 @@
+# Keep laptop temperatures sane: don't let cargo use every thread at once.
+# (12 threads on a Ryzen 5 5500U -> 4 parallel jobs ~ a third of the CPU.)
+[build]
+jobs = 4

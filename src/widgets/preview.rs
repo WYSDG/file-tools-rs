@@ -29,11 +29,20 @@ pub struct Preview {
     crop_drag_start: Rc<RefCell<Option<(f64, f64)>>>,
     crop_cb: Rc<RefCell<Option<Rc<dyn Fn(Option<CropRect>)>>>>,
     bg_color: Rc<RefCell<[f64; 3]>>,
+    on_cursor: Rc<RefCell<Option<Rc<dyn Fn(Option<(i32, i32)>)>>>>,
+    /// The "100%" label, so other widgets (status bar) can mirror it.
+    pub zoom_lbl: gtk::Label,
+    pub zoom_in_btn: gtk::Button,
+    pub zoom_out_btn: gtk::Button,
+    pub fit_btn: gtk::Button,
+    pub one_btn: gtk::Button,
 }
 
 impl Preview {
     pub fn new() -> Self {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
+
+        let on_cursor: Rc<RefCell<Option<Rc<dyn Fn(Option<(i32, i32)>)>>>> = Rc::new(RefCell::new(None));
 
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         controls.set_halign(gtk::Align::Start);
@@ -241,10 +250,26 @@ impl Preview {
             let ebc = eyedropper.clone();
             let hcb_motion = on_hover_hex.clone();
             let hcb_leave = on_hover_hex.clone();
+            let cur_motion = on_cursor.clone();
+            let cur_leave = on_cursor.clone();
 
             let motion = gtk::EventControllerMotion::new();
             motion.connect_motion(move |_, x, y| {
                 *last_on_motion.borrow_mut() = Some((x, y));
+                if let Some(cb) = cur_motion.borrow().as_ref() {
+                    let pos = widget_to_image(
+                        &widget_ref,
+                        *zoom_c.borrow(),
+                        *px.borrow(),
+                        *py.borrow(),
+                        &orig,
+                        &res,
+                        x,
+                        y,
+                    )
+                    .map(|(ix, iy)| (ix as i32, iy as i32));
+                    cb(pos);
+                }
                 if ebc.get() {
                     if let Some((ix, iy)) = widget_to_image(
                         &widget_ref,
@@ -274,6 +299,9 @@ impl Preview {
                 widget_ref.queue_draw();
             });
             motion.connect_leave(move |_| {
+                if let Some(cb) = cur_leave.borrow().as_ref() {
+                    cb(None);
+                }
                 *last_on_leave.borrow_mut() = None;
                 if let Some(cb) = hcb_leave.borrow().as_ref() {
                     cb(None);
@@ -569,7 +597,18 @@ impl Preview {
             crop_drag_start,
             crop_cb,
             bg_color,
+            on_cursor,
+            zoom_lbl,
+            zoom_in_btn: zoom_in,
+            zoom_out_btn: zoom_out,
+            fit_btn,
+            one_btn,
         }
+    }
+
+    /// Called with the image pixel under the pointer (None when outside the image / left the canvas).
+    pub fn set_on_cursor(&self, cb: Rc<dyn Fn(Option<(i32, i32)>)>) {
+        *self.on_cursor.borrow_mut() = Some(cb);
     }
 
     pub fn set_original(&self, path: &Path) {

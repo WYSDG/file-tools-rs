@@ -31,7 +31,7 @@ type TabMetaFn = Rc<dyn Fn() -> (PathBuf, String) + 'static>;
 type InputListener = Rc<dyn Fn(Option<PathBuf>, Option<String>)>;
 
 /// (tab_name, short_label, tooltip, group)
-const RAIL_LAYOUT: &[(&str, &str, &str, &str)] = &[
+pub const RAIL_LAYOUT: &[(&str, &str, &str, &str)] = &[
     ("Remove", "RemBg", "Remove Background", "Isolate"),
     ("Adjust", "Adjst", "Adjust", "Adjust"),
     ("Crop", "Crop", "Crop & Transform", "Adjust"),
@@ -104,6 +104,20 @@ pub struct AppState {
     pub live_gen: Rc<std::cell::Cell<u64>>,
     /// True while a live-preview trigger is running (so commits can be tagged as live).
     pub live_run: Rc<std::cell::Cell<bool>>,
+    /// The History panel (rollback list).
+    pub step_list: Rc<RefCell<Option<ListBox>>>,
+    /// Status-bar labels and undo/redo buttons that follow the document state.
+    pub ui_refs: Rc<RefCell<Option<UiRefs>>>,
+    /// File > Open Recent submenu.
+    pub recent_menu: Rc<RefCell<Option<gtk::gio::Menu>>>,
+}
+
+#[derive(Clone)]
+pub struct UiRefs {
+    pub size_lbl: Label,
+    pub steps_lbl: Label,
+    pub undo_btn: Button,
+    pub redo_btn: Button,
 }
 
 impl AppState {
@@ -186,7 +200,78 @@ impl AppState {
         }
     }
 
+    /// Jump to a point in the history: 0 = original image, n = after step n. Steps after the
+    /// target stay available as redo.
+    pub fn goto_step(&self, target: usize) {
+        let cur = self.history.borrow().len();
+        if target < cur {
+            self.rewind_to(target as isize - 1);
+        } else {
+            for _ in 0..(target - cur) {
+                self.redo();
+            }
+        }
+    }
+
+    /// History panel, status bar, undo/redo button state and the Open Recent menu.
+    pub fn refresh_panels(&self) {
+        let hist: Vec<HistoryEntry> = self.history.borrow().clone();
+        let future: Vec<HistoryEntry> = self.redo_stack.borrow().iter().rev().cloned().collect();
+        let cur = hist.len();
+        let pending = self.pending_commit.borrow().is_some();
+
+        if let Some(list) = self.step_list.borrow().clone() {
+            while let Some(c) = list.first_child() {
+                list.remove(&c);
+            }
+            if self.initial_load.borrow().is_some() {
+                let add = |text: String, class: Option<&str>| {
+                    let row = gtk::ListBoxRow::new();
+                    let lbl = Label::new(Some(&text));
+                    lbl.set_xalign(0.0);
+                    lbl.set_margin_start(8);
+                    lbl.set_margin_end(8);
+                    lbl.set_margin_top(3);
+                    lbl.set_margin_bottom(3);
+                    if let Some(c) = class {
+                        row.add_css_class(c);
+                    }
+                    row.set_child(Some(&lbl));
+                    list.append(&row);
+                };
+                add("Original".to_string(), if cur == 0 { Some("step-current") } else { None });
+                for (i, e) in hist.iter().enumerate() {
+                    add(format!("{}   {}", i + 1, e.label), if i + 1 == cur { Some("step-current") } else { None });
+                }
+                for (i, e) in future.iter().enumerate() {
+                    add(format!("{}   {}", cur + i + 1, e.label), Some("step-future"));
+                }
+            }
+        }
+
+        if let Some(r) = self.ui_refs.borrow().as_ref() {
+            let dims = self.current_head().and_then(|p| crate::util::image_dimensions(&p).ok());
+            r.size_lbl.set_text(&match dims {
+                Some((w, h)) => format!("{} × {} px", w, h),
+                None => "No image".to_string(),
+            });
+            r.steps_lbl.set_text(&format!(
+                "{} step{}{}",
+                cur,
+                if cur == 1 { "" } else { "s" },
+                if pending { " · preview not applied yet" } else { "" }
+            ));
+            r.undo_btn.set_sensitive(cur > 0 || pending);
+            r.redo_btn.set_sensitive(!future.is_empty());
+        }
+
+        if let Some(m) = self.recent_menu.borrow().as_ref() {
+            crate::menus::fill_recent(m);
+        }
+    }
+
     fn refresh_strip(&self) {
+        self.refresh_panels();
         let strip_opt = self.strip_box.borrow().clone();
         let Some(strip) = strip_opt else { return };
 
@@ -700,6 +785,42 @@ pub fn run() {
     app.run_with_args::<&str>(&[]);
 }
 
+/// File chooser for opening an image (toolbar button and File menu).
+pub fn open_image_dialog(app: &AppState, parent: Option<gtk::Window>) {
+    let dialog = gtk::FileDialog::builder().title("Choose an image").build();
+    let app_inner = app.clone();
+    dialog.open(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
+        if let Ok(file) = res {
+            if let Some(path) = file.path() {
+                app_inner.set_universal_input(Some(path));
+            }
+        }
+    });
+}
+
+/// Icon above a small label (toolbar buttons). Falls back to text only if icons aren't available.
+fn big_content(icon_key: &str, label: &str) -> GtkBox {
+    let bx = GtkBox::new(Orientation::Vertical, 1);
+    bx.set_halign(gtk::Align::Center);
+    if let Some(icon) = crate::icons::ui_icon(icon_key) {
+        let img = gtk::Image::from_icon_name(icon);
+        img.set_pixel_size(22);
+        bx.append(&img);
+    }
+    let l = Label::new(Some(label));
+    l.add_css_class("caption");
+    bx.append(&l);
+    bx
+}
+
+fn big_button(icon_key: &str, label: &str, tip: &str) -> Button {
+    let b = Button::new();
+    b.add_css_class("tool-btn");
+    b.set_tooltip_text(Some(tip));
+    b.set_child(Some(&big_content(icon_key, label)));
+    b
+}
+
 fn build_ui(app: &Application) {
     crate::icons::install();
     let settings_init = Settings::load();
@@ -736,6 +857,9 @@ fn build_ui(app: &Application) {
         pending_commit: Rc::new(RefCell::new(None)),
         live_gen: Rc::new(std::cell::Cell::new(0)),
         live_run: Rc::new(std::cell::Cell::new(false)),
+        step_list: Rc::new(RefCell::new(None)),
+        ui_refs: Rc::new(RefCell::new(None)),
+        recent_menu: Rc::new(RefCell::new(None)),
         history_list: Rc::new(RefCell::new(None)),
         fade_box: Rc::new(RefCell::new(None)),
         fade_slider: Rc::new(RefCell::new(None)),
@@ -1235,55 +1359,53 @@ fn build_ui(app: &Application) {
     top_bar.set_margin_end(8);
     top_bar.add_css_class("top-bar");
 
-    let choose_btn = Button::with_label("Choose Image…");
+    let choose_btn = big_button("open", "Open", "Open an image (Ctrl+O)");
     {
         let app_cb = app_state.clone();
         choose_btn.connect_clicked(move |b| {
-            let dialog = gtk::FileDialog::builder().title("Choose an image").build();
-            let app_inner = app_cb.clone();
-            let parent_root = b.root();
-            let parent_window: Option<gtk::Window> =
-                parent_root.and_then(|r| r.downcast::<gtk::Window>().ok());
-            dialog.open(
-                parent_window.as_ref(),
-                gtk::gio::Cancellable::NONE,
-                move |res| {
-                    if let Ok(file) = res {
-                        if let Some(path) = file.path() {
-                            app_inner.set_universal_input(Some(path));
-                        }
-                    }
-                },
-            );
+            let parent = b.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+            open_image_dialog(&app_cb, parent);
         });
     }
     top_bar.append(&choose_btn);
 
-    let paste_btn = Button::with_label("Paste");
+    let paste_btn = big_button("paste", "Paste", "Paste an image from the clipboard (Ctrl+V)");
     {
         let app_cb = app_state.clone();
         paste_btn.connect_clicked(move |_| app_cb.paste_from_clipboard());
     }
     top_bar.append(&paste_btn);
 
+    let undo_btn = big_button("undo", "Undo", "Undo the last step (Ctrl+Z)");
+    {
+        let state = app_state.clone();
+        undo_btn.connect_clicked(move |_| state.undo());
+    }
+    top_bar.append(&undo_btn);
+    let redo_btn = big_button("redo", "Redo", "Redo (Ctrl+Shift+Z)");
+    {
+        let state = app_state.clone();
+        redo_btn.connect_clicked(move |_| state.redo());
+    }
+    top_bar.append(&redo_btn);
+
     top_bar.append(&fname);
 
-    let save_btn = Button::with_label("Save As");
+    let save_btn = big_button("save", "Save As", "Save the current result (Ctrl+S)");
     {
         let state = app_state.clone();
         save_btn.connect_clicked(move |_| state.save_as());
     }
     top_bar.append(&save_btn);
 
-    let copy_btn = Button::with_label("Copy Image");
+    let copy_btn = big_button("copy", "Copy", "Copy the result to the clipboard (Ctrl+C)");
     {
         let state = app_state.clone();
         copy_btn.connect_clicked(move |_| state.copy_result_image());
     }
     top_bar.append(&copy_btn);
 
-    let flush_btn = Button::with_label("Flush");
-    flush_btn.set_tooltip_text(Some("Reset pipeline back to the initial file"));
+    let flush_btn = big_button("reset", "Reset", "Reset everything back to the original image");
     {
         let state = app_state.clone();
         flush_btn.connect_clicked(move |_| state.clear_pipeline());
@@ -1291,7 +1413,7 @@ fn build_ui(app: &Application) {
     top_bar.append(&flush_btn);
 
     let tabs_btn = gtk::MenuButton::new();
-    tabs_btn.set_label("Tabs ▾");
+    tabs_btn.set_child(Some(&big_content("tools", "Tabs")));
     tabs_btn.add_css_class("flat");
     tabs_btn.set_tooltip_text(Some("Show or hide tabs"));
     top_bar.append(&tabs_btn);
@@ -1371,12 +1493,24 @@ fn build_ui(app: &Application) {
     }
 
     let gear_btn = gtk::MenuButton::new();
-    gear_btn.set_label("⚙");
+    gear_btn.set_child(Some(&big_content("settings", "Settings")));
     gear_btn.add_css_class("flat");
     gear_btn.set_tooltip_text(Some("Settings"));
     top_bar.append(&gear_btn);
     show_settings_popover(&gear_btn, app_state.clone());
 
+    let menubar = crate::menus::install(
+        &window,
+        &app_state,
+        rail_buttons.clone(),
+        &gear_btn,
+        {
+            let st = app_state.clone();
+            let w = window.clone();
+            Rc::new(move || open_image_dialog(&st, Some(w.clone().upcast())))
+        },
+    );
+    main.append(&menubar);
     main.append(&top_bar);
 
     // Middle
@@ -1391,7 +1525,46 @@ fn build_ui(app: &Application) {
     right_paned.set_vexpand(true);
     right_paned.set_hexpand(true);
     right_paned.set_start_child(Some(&center));
-    right_paned.set_end_child(Some(&inspector_nb));
+
+    // History panel (rollback list) under the tool settings.
+    let history_panel = GtkBox::new(Orientation::Vertical, 2);
+    history_panel.add_css_class("history-panel");
+    let hist_hdr = Label::new(Some("HISTORY"));
+    hist_hdr.set_xalign(0.0);
+    hist_hdr.set_margin_start(8);
+    hist_hdr.set_margin_top(6);
+    hist_hdr.add_css_class("section-label");
+    history_panel.append(&hist_hdr);
+    let step_list = ListBox::new();
+    step_list.set_selection_mode(gtk::SelectionMode::None);
+    step_list.set_activate_on_single_click(true);
+    let step_scroll = ScrolledWindow::builder()
+        .vexpand(true)
+        .min_content_height(90)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    step_scroll.set_child(Some(&step_list));
+    history_panel.append(&step_scroll);
+    {
+        let state = app_state.clone();
+        step_list.connect_row_activated(move |_, row| {
+            let idx = row.index();
+            if idx >= 0 {
+                state.goto_step(idx as usize);
+            }
+        });
+    }
+    *app_state.step_list.borrow_mut() = Some(step_list);
+
+    let dock = Paned::new(Orientation::Vertical);
+    dock.set_wide_handle(true);
+    dock.set_start_child(Some(&inspector_nb));
+    dock.set_end_child(Some(&history_panel));
+    dock.set_resize_start_child(true);
+    dock.set_shrink_start_child(false);
+    dock.set_resize_end_child(false);
+    dock.set_shrink_end_child(false);
+    right_paned.set_end_child(Some(&dock));
 
     middle.set_position(160);
     right_paned.set_position(800);
@@ -1403,7 +1576,12 @@ fn build_ui(app: &Application) {
         let m = middle.clone();
         let rp = right_paned.clone();
         let w = window.clone();
+        let dk = dock.clone();
         gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+            let height = w.height();
+            if height > 300 {
+                dk.set_position((height as f64 * 0.58) as i32);
+            }
             let width = w.width();
             if width < 300 {
                 return;
@@ -1418,73 +1596,45 @@ fn build_ui(app: &Application) {
         });
     }
 
-    // Bottom strip
-    let bottom = GtkBox::new(Orientation::Horizontal, 8);
-    bottom.set_margin_top(4);
-    bottom.set_margin_bottom(6);
-    bottom.set_margin_start(8);
-    bottom.set_margin_end(8);
-    bottom.set_vexpand(false);
-    bottom.set_valign(gtk::Align::End);
-    bottom.set_size_request(-1, 46);
-
-    let strip = GtkBox::new(Orientation::Horizontal, 4);
-    let strip_scroll = ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Automatic)
-        .vscrollbar_policy(gtk::PolicyType::Never)
-        .min_content_height(40)
-        .max_content_height(48)
-        .vexpand(false)
-        .hexpand(true)
+    // Status bar
+    let status = GtkBox::new(Orientation::Horizontal, 18);
+    status.add_css_class("status-bar");
+    status.set_margin_start(2);
+    let size_lbl = Label::new(Some("No image"));
+    let zoom_lbl = Label::new(Some("100%"));
+    app_state
+        .preview
+        .zoom_lbl
+        .bind_property("label", &zoom_lbl, "label")
+        .sync_create()
         .build();
-    strip_scroll.set_child(Some(&strip));
-    bottom.append(&strip_scroll);
-    *app_state.strip_box.borrow_mut() = Some(strip);
-    app_state.refresh_strip();
-
-    // History — compact
-    let hist_col = GtkBox::new(Orientation::Vertical, 2);
-    hist_col.set_size_request(220, -1);
-    hist_col.set_vexpand(false);
-    hist_col.set_valign(gtk::Align::End);
-
-    let hist_hdr = Label::new(Some("<b>History</b>"));
-    hist_hdr.set_use_markup(true);
-    hist_hdr.set_xalign(0.0);
-    hist_col.append(&hist_hdr);
-
-    let hist_list = ListBox::new();
-    hist_list.set_selection_mode(gtk::SelectionMode::None);
-    hist_list.add_css_class("hist-pane");
-    let hist_scroll = ScrolledWindow::builder()
-        .vexpand(false)
-        .min_content_height(60)
-        .max_content_height(72)
-        .propagate_natural_height(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .build();
-    hist_scroll.set_child(Some(&hist_list));
-    hist_col.append(&hist_scroll);
-    bottom.append(&hist_col);
-
-    *app_state.history_list.borrow_mut() = Some(hist_list.clone());
-    app_state.refresh_history();
-
+    let pos_lbl = Label::new(None);
+    pos_lbl.set_width_chars(16);
+    pos_lbl.set_xalign(0.0);
     {
-        let state = app_state.clone();
-        hist_list.connect_row_activated(move |_, row| {
-            let Some(lbl) = row.child().and_then(|c| c.downcast::<Label>().ok()) else {
-                return;
-            };
-            let name = lbl.text().to_string();
-            let p = config::save_dir().join(name);
-            if p.exists() {
-                state.load_from_history(p);
-            }
-        });
+        let pl = pos_lbl.clone();
+        app_state.preview.set_on_cursor(Rc::new(move |pos| match pos {
+            Some((x, y)) => pl.set_text(&format!("x {}   y {}", x, y)),
+            None => pl.set_text(""),
+        }));
     }
-
-    main.append(&bottom);
+    let steps_lbl = Label::new(Some("0 steps"));
+    steps_lbl.set_hexpand(true);
+    steps_lbl.set_xalign(1.0);
+    steps_lbl.set_margin_end(10);
+    for l in [&size_lbl, &zoom_lbl, &pos_lbl] {
+        l.set_margin_start(8);
+        status.append(l);
+    }
+    status.append(&steps_lbl);
+    *app_state.ui_refs.borrow_mut() = Some(UiRefs {
+        size_lbl,
+        steps_lbl,
+        undo_btn: undo_btn.clone(),
+        redo_btn: redo_btn.clone(),
+    });
+    main.append(&status);
+    app_state.refresh_strip();
     window.set_child(Some(&main));
 
     // Apply initial layout — hide disabled tabs

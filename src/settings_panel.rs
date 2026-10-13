@@ -305,6 +305,12 @@ label.modified           { color: $modified; }
     color: $accent;
     box-shadow: inset 3px 0 0 0 $accent;
 }
+.tool-btn { border-radius: 6px; padding: 3px 8px; min-width: 52px; }
+.status-bar { background-color: $bg_soft; border-top: 1px solid $border; padding: 3px 4px; font-size: 0.9em; }
+menubar { background-color: $bg_soft; border-bottom: 1px solid $border; }
+.history-panel { background-color: $bg; border-top: 1px solid $border; }
+.step-current { background-color: $accent_dim; font-weight: 700; }
+.step-future { opacity: 0.45; font-style: italic; }
 .hist-pane { background-color: $bg_soft; }
 .hist-pane label { color: $fg; padding: 2px 6px; }
 .hist-pane row:selected { background-color: $accent_dim; }

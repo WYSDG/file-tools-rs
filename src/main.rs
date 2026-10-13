@@ -3,6 +3,7 @@
 mod app;
 mod config;
 mod icons;
+mod menus;
 mod settings;
 mod settings_panel;
 mod tabs;

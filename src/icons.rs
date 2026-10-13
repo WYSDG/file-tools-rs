@@ -30,6 +30,15 @@ const ICONS: &[(&str, &str)] = &[
     icon!("ft-stamp"),
     icon!("ft-convert"),
     icon!("ft-paperize"),
+    icon!("ft-open"),
+    icon!("ft-paste"),
+    icon!("ft-save"),
+    icon!("ft-copy"),
+    icon!("ft-undo"),
+    icon!("ft-redo"),
+    icon!("ft-reset"),
+    icon!("ft-settings"),
+    icon!("ft-tools"),
 ];
 
 fn cache_root() -> PathBuf {
@@ -92,4 +101,27 @@ fn svg_supported() -> bool {
             .iter()
             .any(|f| f.name().map(|n| n.eq_ignore_ascii_case("svg")).unwrap_or(false))
     })
+}
+
+/// Icon for a toolbar/menu button (`key` = open, paste, save, copy, undo, redo, reset, settings, tools).
+pub fn ui_icon(key: &str) -> Option<&'static str> {
+    let name = match key {
+        "open" => "ft-open-symbolic",
+        "paste" => "ft-paste-symbolic",
+        "save" => "ft-save-symbolic",
+        "copy" => "ft-copy-symbolic",
+        "undo" => "ft-undo-symbolic",
+        "redo" => "ft-redo-symbolic",
+        "reset" => "ft-reset-symbolic",
+        "settings" => "ft-settings-symbolic",
+        "tools" => "ft-tools-symbolic",
+        _ => return None,
+    };
+    if !svg_supported() {
+        return None;
+    }
+    let found = gtk::gdk::Display::default()
+        .map(|d| gtk::IconTheme::for_display(&d).has_icon(name))
+        .unwrap_or(false);
+    found.then_some(name)
 }

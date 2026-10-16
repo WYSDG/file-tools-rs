@@ -376,6 +376,13 @@ impl RemoveTab {
             }
         };
 
+        // RemBg leaves the original colours under the transparent pixels; clear them so later tools
+        // (halftone, palette, pixelate...) can't "see" the removed background.
+        let mut cmds = cmds;
+        if matches!(out.extension().and_then(|e| e.to_str()), Some("png") | Some("webp")) {
+            cmds.push(vec!["@clean-alpha".into(), out.to_string_lossy().into_owned()]);
+        }
+
         self.base.clone().spawn_processing_with_callback(
             app.clone(),
             input,

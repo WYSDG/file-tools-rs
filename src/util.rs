@@ -514,6 +514,98 @@ pub fn preview_proxy(path: &Path) -> Option<(PathBuf, f64)> {
     Some((out, real_scale))
 }
 
+/// PNG/WebP files (and RemBg results) often keep the *original colours* hidden under fully
+/// transparent pixels. Tools that read colours then "see" a background that isn't visible
+/// (palette, pixelate, blur, dots...). Returns a working copy with that hidden data cleared (keeping
+/// the file name), or `None` when there is nothing to clean / the file isn't an alpha image.
+/// Zero the RGB of fully transparent pixels. Returns true if anything changed.
+fn clear_hidden_colours(rgba: &mut image::RgbaImage) -> bool {
+    let mut changed = false;
+    for px in rgba.pixels_mut() {
+        if px[3] == 0 && (px[0] != 0 || px[1] != 0 || px[2] != 0) {
+            px.0 = [0, 0, 0, 0];
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Same cleanup, rewriting the file in place (used right after RemBg produced it).
+pub fn clear_hidden_colours_in_place(path: &Path) -> Result<(), String> {
+    let mut rgba = image::open(path).map_err(|e| e.to_string())?.to_rgba8();
+    if clear_hidden_colours(&mut rgba) {
+        rgba.save(path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn sanitize_transparency(path: &Path) -> Option<PathBuf> {
+    use image::ImageDecoder;
+    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    if !["png", "webp", "tif", "tiff", "avif", "qoi", "tga"].contains(&ext.as_str()) {
+        return None;
+    }
+    // Cheap check first: does the file even have an alpha channel? (header only, no pixel decode)
+    let decoder = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_decoder().ok()?;
+    if !decoder.color_type().has_alpha() {
+        return None;
+    }
+    let mut rgba = image::open(path).ok()?.to_rgba8();
+    if !clear_hidden_colours(&mut rgba) {
+        return None;
+    }
+    let dir = crate::config::tmp_file(""); // unique name, used as a folder so the file name survives
+    std::fs::create_dir_all(&dir).ok()?;
+    let stem = path.file_stem()?.to_string_lossy().to_string();
+    let out = dir.join(format!("{stem}.png"));
+    let file = std::fs::File::create(&out).ok()?;
+    use image::ImageEncoder;
+    image::codecs::png::PngEncoder::new_with_quality(
+        std::io::BufWriter::new(file),
+        image::codecs::png::CompressionType::Fast,
+        image::codecs::png::FilterType::Adaptive,
+    )
+    .write_image(rgba.as_raw(), rgba.width(), rgba.height(), image::ExtendedColorType::Rgba8)
+    .ok()?;
+    Some(out)
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    fn make(path: &Path) {
+        let mut img = image::RgbaImage::new(20, 20);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            px.0 = if x < 10 { [200, 10, 10, 0] } else if y < 10 { [10, 200, 10, 255] } else { [5, 5, 100, 128] };
+        }
+        img.save(path).unwrap();
+    }
+
+    #[test]
+    fn hidden_colours_are_cleared_for_png_and_webp_and_nothing_else_changes() {
+        let dir = std::env::temp_dir().join("sanitize_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["cutout.png", "cutout.webp"] {
+            let p = dir.join(name);
+            make(&p);
+            let out = sanitize_transparency(&p).expect("hidden colours should be found");
+            assert_eq!(out.file_stem().unwrap(), "cutout", "the name must survive");
+            let img = image::open(&out).unwrap().to_rgba8();
+            assert_eq!(img.get_pixel(3, 3).0, [0, 0, 0, 0], "{name}: hidden colour cleared");
+            assert_eq!(img.get_pixel(15, 3).0, [10, 200, 10, 255], "{name}: opaque pixel untouched");
+            assert_eq!(img.get_pixel(15, 15).0, [5, 5, 100, 128], "{name}: semi-transparent pixel untouched");
+        }
+        // nothing hidden -> nothing to do
+        let clean = dir.join("clean.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255])).save(&clean).unwrap();
+        assert!(sanitize_transparency(&clean).is_none());
+        let jpg = dir.join("photo.jpg");
+        image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3])).save(&jpg).unwrap();
+        assert!(sanitize_transparency(&jpg).is_none());
+    }
+}
+
 #[cfg(test)]
 mod proxy_tests {
     use super::*;

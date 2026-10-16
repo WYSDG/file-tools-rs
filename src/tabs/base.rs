@@ -552,6 +552,11 @@ impl BaseTab {
             .spawn_work(app.clone(), Box::new(move || job(&input, 1.0)), None, true);
     }
 
+    /// A job for this tool is currently running.
+    pub fn is_busy(&self) -> bool {
+        self.processing.get()
+    }
+
     pub fn get_input(&self) -> Option<PathBuf> {
         self.input_path.borrow().clone()
     }
@@ -653,6 +658,11 @@ impl BaseTab {
     ) {
         let work: Box<dyn FnOnce() -> Result<PathBuf, String> + Send> = Box::new(move || {
             for cmd in cmds.iter() {
+                // Internal (non-process) step: clear colours hidden under transparent pixels.
+                if cmd[0] == "@clean-alpha" {
+                    crate::util::clear_hidden_colours_in_place(std::path::Path::new(&cmd[1]))?;
+                    continue;
+                }
                 let output = Command::new(&cmd[0]).args(&cmd[1..]).output();
                 match output {
                     Ok(o) if o.status.success() => {}

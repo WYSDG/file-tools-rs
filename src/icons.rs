@@ -39,6 +39,8 @@ const ICONS: &[(&str, &str)] = &[
     icon!("ft-reset"),
     icon!("ft-settings"),
     icon!("ft-tools"),
+    icon!("ft-resize"),
+    icon!("ft-recent"),
 ];
 
 fn cache_root() -> PathBuf {
@@ -115,6 +117,8 @@ pub fn ui_icon(key: &str) -> Option<&'static str> {
         "reset" => "ft-reset-symbolic",
         "settings" => "ft-settings-symbolic",
         "tools" => "ft-tools-symbolic",
+        "resize" => "ft-resize-symbolic",
+        "recent" => "ft-recent-symbolic",
         _ => return None,
     };
     if !svg_supported() {

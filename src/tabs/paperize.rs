@@ -265,6 +265,78 @@ fn shadow_map(cov: &[f32], w: u32, h: u32, off: i32, sigma: f32) -> Vec<f32> {
 
 
 // ---------------------------------------------------------------------------
+// Distance transform (Felzenszwalb & Huttenlocher), used for the sheet outline
+// ---------------------------------------------------------------------------
+
+const FAR: f32 = 1.0e9;
+
+/// 1-D squared-distance transform of `f` (length n) into `d`.
+fn dt1d(f: &[f32], d: &mut [f32], v: &mut [usize], z: &mut [f32]) {
+    let n = f.len();
+    let mut k = 0usize;
+    v[0] = 0;
+    z[0] = -FAR;
+    z[1] = FAR;
+    for q in 1..n {
+        let mut s;
+        loop {
+            let vk = v[k];
+            s = ((f[q] + (q * q) as f32) - (f[vk] + (vk * vk) as f32)) / (2.0 * q as f32 - 2.0 * vk as f32);
+            if s <= z[k] && k > 0 {
+                k -= 1;
+            } else {
+                break;
+            }
+        }
+        k += 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = FAR;
+    }
+    k = 0;
+    for (q, out) in d.iter_mut().enumerate().take(n) {
+        while z[k + 1] < q as f32 {
+            k += 1;
+        }
+        let dq = q as f32 - v[k] as f32;
+        *out = dq * dq + f[v[k]];
+    }
+}
+
+/// Euclidean distance from every pixel to the nearest `true` pixel of `feature` (0 on the feature).
+fn edt(feature: &[bool], w: usize, h: usize) -> Vec<f32> {
+    let mut g: Vec<f32> = feature.iter().map(|&b| if b { 0.0 } else { FAR }).collect();
+    let (mut v, mut z) = (vec![0usize; w.max(h)], vec![0f32; w.max(h) + 1]);
+    // columns
+    let (mut col, mut out) = (vec![0f32; h], vec![0f32; h]);
+    for x in 0..w {
+        for y in 0..h {
+            col[y] = g[y * w + x];
+        }
+        dt1d(&col, &mut out, &mut v, &mut z);
+        for y in 0..h {
+            g[y * w + x] = out[y];
+        }
+    }
+    // rows
+    let (mut row, mut out) = (vec![0f32; w], vec![0f32; w]);
+    for y in 0..h {
+        row.copy_from_slice(&g[y * w..(y + 1) * w]);
+        dt1d(&row, &mut out, &mut v, &mut z);
+        g[y * w..(y + 1) * w].copy_from_slice(&out);
+    }
+    g.iter().map(|&d| d.sqrt()).collect()
+}
+
+/// Signed distance to the subject's outline: positive inside the subject, negative outside.
+fn signed_distance(subject: &[bool], w: usize, h: usize) -> Vec<f32> {
+    let d_out = edt(subject, w, h); // distance to the subject, for pixels outside it
+    let inv: Vec<bool> = subject.iter().map(|&b| !b).collect();
+    let d_in = edt(&inv, w, h); // distance to the outside, for pixels inside the subject
+    (0..w * h).map(|i| if subject[i] { d_in[i] } else { -d_out[i] }).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Renderer
 // ---------------------------------------------------------------------------
 
@@ -305,10 +377,21 @@ pub fn render_paperize(input: &Path, out: &Path, p: &PaperParams, scale: f32) ->
     let (ox, oy) = (ext as i32, ext as i32);
     let (wi, hi) = (w as i32, h as i32);
 
-    let (rx0, rx1, ry0, ry1) = if p.border {
-        (ox as f32 - grow, (ox + wi) as f32 + grow, oy as f32 - grow, (oy + hi) as f32 + grow)
+    // Signed distance to the subject's outline (opaque pixels of the source). A fully opaque photo
+    // is a rectangle; a cut-out PNG gets a border that hugs its real silhouette and everything
+    // away from the subject stays transparent.
+    let sdist: Vec<f32> = if p.border {
+        let mut subject = vec![false; cwu * chu];
+        for y in 0..hi {
+            for x in 0..wi {
+                if src.get_pixel(x as u32, y as u32)[3] > 127 {
+                    subject[(y + oy) as usize * cwu + (x + ox) as usize] = true;
+                }
+            }
+        }
+        signed_distance(&subject, cwu, chu)
     } else {
-        (-1.0e6, 1.0e6, -1.0e6, 1.0e6)
+        Vec::new()
     };
 
     let paper_col = paper_base(p.paper);
@@ -321,7 +404,7 @@ pub fn render_paperize(input: &Path, out: &Path, p: &PaperParams, scale: f32) ->
     for y in 0..ch as i32 {
         for x in 0..cw as i32 {
             let (xf, yf) = (x as f32 + 0.5, y as f32 + 0.5);
-            let sd = (xf - rx0).min(rx1 - xf).min(yf - ry0).min(ry1 - yf);
+            let sd = if p.border { sdist[y as usize * cwu + x as usize] + grow } else { 1.0e6 };
             let (xr, yr) = (xf / sc, yf / sc);
 
             let near = amp > 0.0 && sd.abs() < amp * 1.6 + rim + 3.0;
@@ -362,6 +445,20 @@ pub fn render_paperize(input: &Path, out: &Path, p: &PaperParams, scale: f32) ->
                 let n = (fbm(xr / 9.0, yr / 9.0, 2, 53) - 0.5) * 0.7;
                 let m = 1.0 - smoothstep(0.0, 1.0, (t + n).clamp(0.0, 1.0));
                 col = lerp3(col, core, m);
+            }
+
+            // crumpled-paper shading (strong on the paper, subtle on the photo)
+            {
+                let on_photo = in_photo && a_src > 0.5;
+                if (p.border && !on_photo) || wa > 0.0 {
+                    let ridge = 1.0 - (fbm(xr / 26.0, yr / 26.0, 4, 91) - 0.5).abs() * 2.0;
+                    let k = if on_photo {
+                        (ridge - 0.55) * 0.18 * wa
+                    } else {
+                        (ridge - 0.55) * 0.55 * (0.35 + 0.65 * wa)
+                    };
+                    col = [col[0] * (1.0 + k), col[1] * (1.0 + k), col[2] * (1.0 + k)];
+                }
             }
 
             // --- per-pixel weathering ---
@@ -561,6 +658,40 @@ mod tests {
     }
 
     #[test]
+    fn border_follows_a_cutouts_silhouette_and_leaves_transparent_areas_alone() {
+        // A PNG with a transparent background (colour hidden underneath, as RemBg leaves it)
+        // and an opaque disc in the middle.
+        let dir = std::env::temp_dir();
+        let (inp, out) = (dir.join("pz5_in.png"), dir.join("pz5_out.png"));
+        let mut img = RgbaImage::new(240, 240);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let d2 = (x as i32 - 120).pow(2) + (y as i32 - 120).pow(2);
+            px.0 = if d2 < 50 * 50 { [200, 60, 60, 255] } else { [90, 200, 90, 0] };
+        }
+        img.save(&inp).unwrap();
+        let mut p = params();
+        p.size = 0.05; // 12 px
+        p.rough = 0.0;
+        p.shadow = 0.0;
+        p.rim = 0.0;
+        render_paperize(&inp, &out, &p, 1.0).unwrap();
+        let res = image::open(&out).unwrap().to_rgba8();
+        let (cw, ch) = res.dimensions();
+        let (cx, cy) = (cw / 2, ch / 2);
+        // inside the disc: the photo
+        let c = res.get_pixel(cx, cy);
+        assert!(c[3] == 255 && c[0] > 150 && c[2] < 100, "photo in the middle: {c:?}");
+        // 6 px outside the disc: paper border (cream), opaque
+        let b = res.get_pixel(cx + 56, cy);
+        assert!(b[3] == 255 && b[0] > 180 && b[1] > 170 && b[2] > 120, "paper border expected: {b:?}");
+        // 30 px outside the disc: untouched transparent background (NOT paper)
+        let t = res.get_pixel(cx + 80, cy);
+        assert_eq!(t[3], 0, "transparent areas must stay transparent: {t:?}");
+        // the image corners are transparent too
+        assert_eq!(res.get_pixel(cx + 100, cy + 100)[3], 0);
+    }
+
+    #[test]
     fn torn_photo_edges_eat_into_the_photo() {
         let dir = std::env::temp_dir();
         let (inp, out) = (dir.join("pz3_in.png"), dir.join("pz3_out.png"));
@@ -639,5 +770,7 @@ mod samples {
             paper: 0, bg: 1, weather: 0.85, grain: 0.35,
         };
         render_paperize(Path::new("/tmp/landscape.png"), Path::new("/tmp/pz_style_b.png"), &p, 1.0).unwrap();
+        let q = PaperParams { border: true, style: 0, size: 0.06, rough: 0.7, rim: 12.0, shadow: 0.5, thick: 6.0, paper: 1, bg: 1, weather: 0.45, grain: 0.3 };
+        render_paperize(Path::new("/tmp/cutout.png"), Path::new("/tmp/pz_cutout.png"), &q, 1.0).unwrap();
     }
 }

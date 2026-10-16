@@ -21,6 +21,8 @@ pub struct Settings {
     /// Settings schema version for the theme names (2 = "dark"/"black" naming).
     #[serde(default)]
     pub theme_v: u32,
+    /// Toolbox size: 0 = small (1 column), 1 = medium (2 columns), 2 = large (2 columns + names).
+    pub toolbox_size: u32,
 }
 
 impl Default for Settings {
@@ -39,6 +41,7 @@ impl Default for Settings {
             show_tooltips: true,
             theme: "blue".to_string(),
             theme_v: 2,
+            toolbox_size: 1,
         }
     }
 }
@@ -292,9 +295,8 @@ label.modified           { color: $modified; }
 .rail-pane { background-color: $bg; border-right: 1px solid $border; }
 .inspector-pane { background-color: $bg; border-left: 1px solid $border; }
 .top-bar { background-color: $bg_soft; border-bottom: 1px solid $border; }
+flowboxchild { padding: 0; background: none; }
 .rail-btn {
-    min-width: 56px;
-    min-height: 44px;
     padding: 2px 4px;
     font-size: 0.95em;
     color: $fg;
@@ -306,9 +308,14 @@ label.modified           { color: $modified; }
     box-shadow: inset 3px 0 0 0 $accent;
 }
 .tool-btn { border-radius: 6px; padding: 3px 8px; min-width: 52px; }
+.status-zoom button { min-height: 20px; padding: 0 8px; }
+.status-zoom label { padding: 0 6px; }
 .status-bar { background-color: $bg_soft; border-top: 1px solid $border; padding: 3px 4px; font-size: 0.9em; }
 menubar { background-color: $bg_soft; border-bottom: 1px solid $border; }
-.history-panel { background-color: $bg; border-top: 1px solid $border; }
+.history-panel, .history-panel scrolledwindow, .history-panel viewport,
+.history-panel list, .history-panel row { background-color: $bg; color: $fg; }
+.history-panel { border-top: 1px solid $border; }
+.history-panel row:hover { background-color: $accent_dim; }
 .step-current { background-color: $accent_dim; font-weight: 700; }
 .step-future { opacity: 0.45; font-style: italic; }
 .hist-pane { background-color: $bg_soft; }

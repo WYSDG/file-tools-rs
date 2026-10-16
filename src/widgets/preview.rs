@@ -32,6 +32,8 @@ pub struct Preview {
     on_cursor: Rc<RefCell<Option<Rc<dyn Fn(Option<(i32, i32)>)>>>>,
     /// The "100%" label, so other widgets (status bar) can mirror it.
     pub zoom_lbl: gtk::Label,
+    /// Zoom −/%/+/Fit/1:1. Not part of the canvas; the status bar hosts it.
+    pub controls: gtk::Box,
     pub zoom_in_btn: gtk::Button,
     pub zoom_out_btn: gtk::Button,
     pub fit_btn: gtk::Button,
@@ -59,7 +61,6 @@ impl Preview {
         controls.append(&zoom_in);
         controls.append(&fit_btn);
         controls.append(&one_btn);
-        root.append(&controls);
 
         let canvas = gtk::DrawingArea::new();
         canvas.set_vexpand(true);
@@ -599,6 +600,7 @@ impl Preview {
             bg_color,
             on_cursor,
             zoom_lbl,
+            controls,
             zoom_in_btn: zoom_in,
             zoom_out_btn: zoom_out,
             fit_btn,
@@ -811,6 +813,34 @@ fn load_surface(path: &Path) -> (Option<cairo::ImageSurface>, Option<image::Rgba
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Checkerboard in device pixels (8px cells), anchored at the image's top-left corner.
+fn paint_checker(cr: &cairo::Context, bg: [f64; 3], dx: f64, dy: f64, dw: f64, dh: f64) {
+    let lum = 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2];
+    let (a, b) = if lum < 0.5 { (0.21, 0.31) } else { (0.78, 0.92) };
+    let cell = 8i32;
+    let Ok(tile) = cairo::ImageSurface::create(cairo::Format::Rgb24, cell * 2, cell * 2) else {
+        return;
+    };
+    if let Ok(tcr) = cairo::Context::new(&tile) {
+        tcr.set_source_rgb(a, a, a);
+        let _ = tcr.paint();
+        tcr.set_source_rgb(b, b, b);
+        tcr.rectangle(0.0, 0.0, cell as f64, cell as f64);
+        tcr.rectangle(cell as f64, cell as f64, cell as f64, cell as f64);
+        let _ = tcr.fill();
+    }
+    let pat = cairo::SurfacePattern::create(&tile);
+    pat.set_extend(cairo::Extend::Repeat);
+    pat.set_filter(cairo::Filter::Nearest);
+    pat.set_matrix(cairo::Matrix::new(1.0, 0.0, 0.0, 1.0, -dx, -dy));
+    let _ = cr.save();
+    cr.rectangle(dx, dy, dw, dh);
+    cr.clip();
+    let _ = cr.set_source(&pat);
+    let _ = cr.paint();
+    let _ = cr.restore();
+}
+
 fn draw_layers(
     cr: &cairo::Context,
     w: i32,
@@ -877,37 +907,12 @@ fn draw_layers(
     let dx = (w as f64 - dw) / 2.0 + pan_x;
     let dy = (h as f64 - dh) / 2.0 + pan_y;
 
-    // Checkerboard behind the image so transparent areas are always visible
-    // (e.g. black halftone dots on a transparent background over a black canvas).
-    {
-        let lum = 0.2126 * bg[0] + 0.7152 * bg[1] + 0.0722 * bg[2];
-        let (a, b) = if lum < 0.5 { (0.21, 0.31) } else { (0.78, 0.92) };
-        let cell = 8i32;
-        if let Ok(tile) = cairo::ImageSurface::create(cairo::Format::Rgb24, cell * 2, cell * 2) {
-            if let Ok(tcr) = cairo::Context::new(&tile) {
-                tcr.set_source_rgb(a, a, a);
-                let _ = tcr.paint();
-                tcr.set_source_rgb(b, b, b);
-                tcr.rectangle(0.0, 0.0, cell as f64, cell as f64);
-                tcr.rectangle(cell as f64, cell as f64, cell as f64, cell as f64);
-                let _ = tcr.fill();
-            }
-            let pat = cairo::SurfacePattern::create(&tile);
-            pat.set_extend(cairo::Extend::Repeat);
-            pat.set_filter(cairo::Filter::Nearest);
-            pat.set_matrix(cairo::Matrix::new(1.0, 0.0, 0.0, 1.0, -dx, -dy));
-            let _ = cr.save();
-            cr.rectangle(dx, dy, dw, dh);
-            cr.clip();
-            let _ = cr.set_source(&pat);
-            let _ = cr.paint();
-            let _ = cr.restore();
-        }
-    }
-
-    let draw_original = !(result.is_some() && fade >= 0.99);
-    if draw_original {
-        if let Some(o) = original {
+    // Layers: checkerboard -> original -> (result over its own checkerboard) at `fade` opacity.
+    // That is a true crossfade original <-> result, so a cutout's removed background fades out
+    // smoothly instead of vanishing at 100%.
+    paint_checker(cr, bg, dx, dy, dw, dh);
+    if let Some(o) = original {
+        if result.is_none() || fade < 0.999 {
             let _ = cr.save();
             cr.translate(dx, dy);
             cr.scale(scale, scale);
@@ -918,12 +923,21 @@ fn draw_layers(
     }
     if let Some(r) = result {
         if fade > 0.0 {
+            let blend = original.is_some() && fade < 0.999;
+            if blend {
+                let _ = cr.push_group();
+                paint_checker(cr, bg, dx, dy, dw, dh);
+            }
             let _ = cr.save();
             cr.translate(dx, dy);
             cr.scale(scale, scale);
             let _ = cr.set_source_surface(r, 0.0, 0.0);
-            let _ = cr.paint_with_alpha(fade);
+            let _ = cr.paint();
             let _ = cr.restore();
+            if blend {
+                let _ = cr.pop_group_to_source();
+                let _ = cr.paint_with_alpha(fade);
+            }
         }
     }
 

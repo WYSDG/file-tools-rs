@@ -1,3 +1,7 @@
+//! Crop & Transform — direct, single-purpose actions (like paint.net):
+//! rotate/flip buttons apply immediately, and the crop box, angle, resize and trim each have
+//! their own button. Every action becomes one History step. (There is no generic "Process" button.)
+
 use gtk::prelude::*;
 use gtk4 as gtk;
 use std::cell::RefCell;
@@ -7,6 +11,14 @@ use crate::app::AppState;
 use crate::config;
 use crate::tabs::base::BaseTab;
 
+const OP_ROTFLIP: u8 = 1;
+const OP_ANGLE: u8 = 2;
+const OP_CROP: u8 = 4;
+const OP_RESIZE: u8 = 8;
+const OP_TRIM: u8 = 16;
+
+const CROP_HINT: &str = "Drag on the image to draw a crop box";
+
 pub struct CropTab {
     pub base: BaseTab,
     pub rotate_cw: gtk::Button,
@@ -15,11 +27,14 @@ pub struct CropTab {
     pub flip_h: gtk::Button,
     pub flip_v: gtk::Button,
     pub angle: gtk::Scale,
+    pub apply_angle: gtk::Button,
     pub w_entry: gtk::Entry,
     pub h_entry: gtk::Entry,
+    pub apply_resize: gtk::Button,
     pub fuzz: gtk::Scale,
-    pub do_trim: gtk::Switch,
+    pub apply_trim: gtk::Button,
     pub fmt: gtk::DropDown,
+    pub apply_crop: gtk::Button,
     pub clear_crop: gtk::Button,
     pub crop_info: gtk::Label,
     rotate_quarters: Rc<RefCell<i32>>,
@@ -31,73 +46,71 @@ pub struct CropTab {
 impl CropTab {
     pub fn new(app: AppState) -> Rc<Self> {
         let base = BaseTab::new("Cropped", Some("Cropped"), "Crop & Transform", app.clone());
+        // No generic Process button: every action below applies by itself.
+        base.go.set_visible(false);
 
-        // ---- Rotate & flip ----
-        let hdr = gtk::Label::new(Some("ROTATE & FLIP"));
-        hdr.set_xalign(0.0);
-        hdr.add_css_class("section-label");
-        base.controls.append(&hdr);
+        let section = |text: &str| {
+            let l = gtk::Label::new(Some(text));
+            l.set_xalign(0.0);
+            l.add_css_class("section-label");
+            l
+        };
 
+        // ---- Rotate & flip (apply immediately) ----
+        base.controls.append(&section("ROTATE & FLIP"));
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let rotate_ccw = gtk::Button::with_label("⟲ 90°");
         let rotate_180 = gtk::Button::with_label("180°");
         let rotate_cw = gtk::Button::with_label("⟳ 90°");
         let flip_h = gtk::Button::with_label("Flip H");
         let flip_v = gtk::Button::with_label("Flip V");
-        row.append(&rotate_ccw);
-        row.append(&rotate_180);
-        row.append(&rotate_cw);
-        row.append(&flip_h);
-        row.append(&flip_v);
+        for b in [&rotate_ccw, &rotate_180, &rotate_cw, &flip_h, &flip_v] {
+            row.append(b);
+        }
         base.controls.append(&row);
 
         let angle = base.tracked_slider("Custom Angle", -180.0, 180.0, 0.0);
+        let apply_angle = gtk::Button::with_label("Rotate by angle");
+        base.controls.append(&apply_angle);
 
         // ---- Crop region ----
-        let hdr2 = gtk::Label::new(Some("CROP REGION"));
-        hdr2.set_xalign(0.0);
-        hdr2.add_css_class("section-label");
-        base.controls.append(&hdr2);
-
-        let crop_info = gtk::Label::new(Some("Drag on the preview to define a crop rectangle"));
+        base.controls.append(&section("CROP"));
+        let crop_info = gtk::Label::new(Some(CROP_HINT));
         crop_info.set_xalign(0.0);
         crop_info.set_wrap(true);
-        crop_info.add_css_class("section-label");
         base.controls.append(&crop_info);
-
-        let clear_crop = gtk::Button::with_label("Clear Crop");
-        base.controls.append(&clear_crop);
+        let crop_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let apply_crop = gtk::Button::with_label("Crop to selection");
+        apply_crop.add_css_class("suggested-action");
+        let clear_crop = gtk::Button::with_label("Clear");
+        crop_row.append(&apply_crop);
+        crop_row.append(&clear_crop);
+        base.controls.append(&crop_row);
 
         // ---- Resize ----
-        let hdr3 = gtk::Label::new(Some("RESIZE (blank = keep)"));
-        hdr3.set_xalign(0.0);
-        hdr3.add_css_class("section-label");
-        base.controls.append(&hdr3);
-
+        base.controls.append(&section("RESIZE (blank = keep)"));
         let rr = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         rr.append(&gtk::Label::new(Some("W")));
         let w_entry = gtk::Entry::new();
         w_entry.set_placeholder_text(Some("auto"));
+        w_entry.set_width_chars(5);
+        w_entry.set_max_width_chars(5);
         rr.append(&w_entry);
         rr.append(&gtk::Label::new(Some("H")));
         let h_entry = gtk::Entry::new();
         h_entry.set_placeholder_text(Some("auto"));
+        h_entry.set_width_chars(5);
+        h_entry.set_max_width_chars(5);
         rr.append(&h_entry);
+        let apply_resize = gtk::Button::with_label("Resize");
+        rr.append(&apply_resize);
         base.controls.append(&rr);
 
         // ---- Trim ----
-        let hdr4 = gtk::Label::new(Some("TRIM"));
-        hdr4.set_xalign(0.0);
-        hdr4.add_css_class("section-label");
-        base.controls.append(&hdr4);
-
-        let fuzz = base.tracked_slider("Trim Fuzz", 0.0, 20.0, 5.0);
-
-        let trim_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        trim_row.append(&gtk::Label::new(Some("Trim transparent borders")));
-        let do_trim = gtk::Switch::new();
-        trim_row.append(&do_trim);
-        base.controls.append(&trim_row);
+        base.controls.append(&section("TRIM"));
+        let fuzz = base.tracked_slider("Trim fuzz", 0.0, 20.0, 5.0);
+        let apply_trim = gtk::Button::with_label("Trim empty borders");
+        base.controls.append(&apply_trim);
 
         // ---- Format ----
         let fmt_lbl = gtk::Label::new(Some("Output format"));
@@ -106,15 +119,10 @@ impl CropTab {
         let fmt = gtk::DropDown::from_strings(&["png", "jpg", "webp"]);
         base.controls.append(&fmt);
 
-        let rotate_quarters: Rc<RefCell<i32>> = Rc::new(RefCell::new(0));
-        let flip_h_state: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-        let flip_v_state: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
-
         base.register_slider("angle", &angle);
         base.register_entry("w", &w_entry);
         base.register_entry("h", &h_entry);
         base.register_slider("fuzz", &fuzz);
-        base.register_switch("do_trim", &do_trim);
         base.register_dropdown("fmt", &fmt);
 
         let this = Rc::new(Self {
@@ -125,207 +133,149 @@ impl CropTab {
             flip_h,
             flip_v,
             angle,
+            apply_angle,
             w_entry,
             h_entry,
+            apply_resize,
             fuzz,
-            do_trim,
+            apply_trim,
             fmt,
+            apply_crop,
             clear_crop,
             crop_info,
-            rotate_quarters: rotate_quarters.clone(),
-            flip_h_state: flip_h_state.clone(),
-            flip_v_state: flip_v_state.clone(),
+            rotate_quarters: Rc::new(RefCell::new(0)),
+            flip_h_state: Rc::new(RefCell::new(false)),
+            flip_v_state: Rc::new(RefCell::new(false)),
             app: app.clone(),
         });
 
-        // ---- Wire rotate/flip ----
-        {
+        // ---- rotate / flip: one click = one step ----
+        let wire_rotflip = |btn: &gtk::Button, quarters: i32, fh: bool, fv: bool| {
             let t = this.clone();
-            this.rotate_cw.connect_clicked(move |_| {
-                *t.rotate_quarters.borrow_mut() = (*t.rotate_quarters.borrow() + 1) % 4;
-                t.base.schedule_live_process();
+            let a = app.clone();
+            btn.connect_clicked(move |_| {
+                if t.base.is_busy() {
+                    return;
+                }
+                *t.rotate_quarters.borrow_mut() = quarters;
+                *t.flip_h_state.borrow_mut() = fh;
+                *t.flip_v_state.borrow_mut() = fv;
+                t.run_ops(&a, OP_ROTFLIP);
             });
-        }
-        {
-            let t = this.clone();
-            this.rotate_ccw.connect_clicked(move |_| {
-                *t.rotate_quarters.borrow_mut() = (*t.rotate_quarters.borrow() + 3) % 4;
-                t.base.schedule_live_process();
-            });
-        }
-        {
-            let t = this.clone();
-            this.rotate_180.connect_clicked(move |_| {
-                *t.rotate_quarters.borrow_mut() = (*t.rotate_quarters.borrow() + 2) % 4;
-                t.base.schedule_live_process();
-            });
-        }
-        {
-            let t = this.clone();
-            this.flip_h.connect_clicked(move |_| {
-                let cur = *t.flip_h_state.borrow();
-                *t.flip_h_state.borrow_mut() = !cur;
-                t.base.schedule_live_process();
-            });
-        }
-        {
-            let t = this.clone();
-            this.flip_v.connect_clicked(move |_| {
-                let cur = *t.flip_v_state.borrow();
-                *t.flip_v_state.borrow_mut() = !cur;
-                t.base.schedule_live_process();
-            });
-        }
+        };
+        wire_rotflip(&this.rotate_cw, 1, false, false);
+        wire_rotflip(&this.rotate_ccw, 3, false, false);
+        wire_rotflip(&this.rotate_180, 2, false, false);
+        wire_rotflip(&this.flip_h, 0, true, false);
+        wire_rotflip(&this.flip_v, 0, false, true);
 
-        // ---- Wire resize fields ----
-        {
+        // ---- the other actions ----
+        for (btn, ops) in [
+            (&this.apply_angle, OP_ANGLE),
+            (&this.apply_crop, OP_CROP),
+            (&this.apply_resize, OP_RESIZE),
+            (&this.apply_trim, OP_TRIM),
+        ] {
             let t = this.clone();
-            this.w_entry
-                .connect_changed(move |_| t.base.schedule_live_process());
+            let a = app.clone();
+            btn.connect_clicked(move |_| t.run_ops(&a, ops));
         }
-        {
-            let t = this.clone();
-            this.h_entry
-                .connect_changed(move |_| t.base.schedule_live_process());
-        }
-
-        // ---- Wire trim toggle ----
-        {
-            let t = this.clone();
-            this.do_trim.connect_state_set(move |_, _| {
-                t.base.schedule_live_process();
-                gtk::glib::Propagation::Proceed
-            });
-        }
-
-        // ---- Clear Crop ----
         {
             let t = this.clone();
             this.clear_crop.connect_clicked(move |_| {
                 t.app.preview.set_crop_overlay(None);
-                t.crop_info
-                    .set_text("Drag on the preview to define a crop rectangle");
-                t.base.schedule_live_process();
+                t.crop_info.set_text(CROP_HINT);
             });
         }
 
-        // ---- Crop rect callback ----
+        // The crop box itself is just an overlay; applying is an explicit action.
         {
             let t = this.clone();
-            app.preview.set_on_crop_changed(Rc::new(move |rect| {
-                match rect {
-                    Some((x, y, w, h)) => {
-                        t.crop_info
-                            .set_text(&format!("Crop: {}×{} at ({}, {})", w, h, x, y));
-                    }
-                    None => {
-                        t.crop_info
-                            .set_text("Drag on the preview to define a crop rectangle");
-                    }
-                }
-                t.base.schedule_live_process();
+            app.preview.set_on_crop_changed(Rc::new(move |rect| match rect {
+                Some((x, y, w, h)) => t.crop_info.set_text(&format!("Crop: {}×{} at ({}, {})", w, h, x, y)),
+                None => t.crop_info.set_text(CROP_HINT),
             }));
-        }
-
-        // ---- Live preview: PREVIEW-ONLY (does not commit) ----
-        this.base.set_live_preview(true, 500);
-        {
-            let t = this.clone();
-            let ac = app.clone();
-            this.base
-                .set_live_trigger(Rc::new(move || t.run(&ac, false)));
         }
 
         this
     }
 
-    /// `commit = true` → full pipeline commit (Apply Now).
-    /// `commit = false` → preview only (live trigger).
-    pub fn run(self: &Rc<Self>, app: &AppState, commit: bool) {
+    /// Ctrl+Enter: crop to the current box (if there is one).
+    pub fn run(self: &Rc<Self>, app: &AppState, _commit: bool) {
+        self.run_ops(app, OP_CROP);
+    }
+
+    /// Apply only the operations in `ops` to the tool's input; result = one new History step.
+    fn run_ops(self: &Rc<Self>, app: &AppState, ops: u8) {
+        if self.base.is_busy() {
+            self.base.set_status("Still working on the previous action…", true);
+            return;
+        }
         let Some(input) = self.base.get_input() else {
             self.base.set_status("Load an image first", true);
             return;
         };
-        // Nothing chosen yet? Say so instead of silently producing an identical copy.
-        let has_crop = app
-            .preview
-            .get_crop_overlay()
-            .map(|(_, _, w, h)| w > 0 && h > 0)
-            .unwrap_or(false);
-        let has_size = !self.w_entry.text().trim().is_empty() || !self.h_entry.text().trim().is_empty();
-        let has_ops = *self.rotate_quarters.borrow() != 0
-            || *self.flip_h_state.borrow()
-            || *self.flip_v_state.borrow()
-            || self.angle.value().round() as i32 != 0
-            || has_crop
-            || has_size
-            || self.do_trim.is_active();
-        if !has_ops {
-            if commit {
-                self.base.set_status(
-                    "Nothing to apply yet: drag a crop box on the image, or rotate / flip / resize / trim.",
-                    true,
-                );
-            }
+
+        let use_rot = ops & OP_ROTFLIP != 0;
+        let quarters = if use_rot { *self.rotate_quarters.borrow() } else { 0 };
+        let flip_h = use_rot && *self.flip_h_state.borrow();
+        let flip_v = use_rot && *self.flip_v_state.borrow();
+        let ang = if ops & OP_ANGLE != 0 { self.angle.value().round() as i32 } else { 0 };
+        let crop = if ops & OP_CROP != 0 {
+            app.preview.get_crop_overlay().filter(|(_, _, w, h)| *w > 0 && *h > 0)
+        } else {
+            None
+        };
+        let (w_txt, h_txt) = if ops & OP_RESIZE != 0 {
+            (self.w_entry.text().trim().to_string(), self.h_entry.text().trim().to_string())
+        } else {
+            (String::new(), String::new())
+        };
+        let trim = ops & OP_TRIM != 0;
+
+        // Nothing to do? Say what's missing instead of silently doing nothing.
+        let missing = match ops {
+            OP_ANGLE if ang == 0 => Some("Move the angle slider first."),
+            OP_CROP if crop.is_none() => Some("Drag a crop box on the image first."),
+            OP_RESIZE if w_txt.is_empty() && h_txt.is_empty() => Some("Enter a width and/or a height first."),
+            _ => None,
+        };
+        if let Some(msg) = missing {
+            self.base.set_status(msg, true);
             return;
         }
 
         let fmts = ["png", "jpg", "webp"];
-        let fmt = fmts
-            .get(self.fmt.selected() as usize)
-            .copied()
-            .unwrap_or("png");
+        let fmt = fmts.get(self.fmt.selected() as usize).copied().unwrap_or("png");
         let out = config::tmp_file(&format!(".{}", fmt));
 
         let mut cmd: Vec<String> = vec!["magick".into(), input.to_string_lossy().into_owned()];
-
-        let quarters = *self.rotate_quarters.borrow();
         if quarters != 0 {
             cmd.extend(["-rotate".into(), (quarters * 90).to_string()]);
         }
-        if *self.flip_h_state.borrow() {
+        if flip_h {
             cmd.push("-flop".into());
         }
-        if *self.flip_v_state.borrow() {
+        if flip_v {
             cmd.push("-flip".into());
         }
-
-        let ang = self.angle.value().round() as i32;
         if ang != 0 {
-            cmd.extend([
-                "-background".into(),
-                "none".into(),
-                "-rotate".into(),
-                ang.to_string(),
-            ]);
+            cmd.extend(["-background".into(), "none".into(), "-rotate".into(), ang.to_string()]);
         }
-
-        if let Some((x, y, w, h)) = app.preview.get_crop_overlay() {
-            if w > 0 && h > 0 {
-                cmd.extend([
-                    "-crop".into(),
-                    format!("{}x{}+{}+{}", w, h, x, y),
-                    "+repage".into(),
-                ]);
-            }
+        if let Some((x, y, w, h)) = crop {
+            cmd.extend(["-crop".into(), format!("{}x{}+{}+{}", w, h, x, y), "+repage".into()]);
         }
-
-        let w = self.w_entry.text().to_string();
-        let h = self.h_entry.text().to_string();
-        let w = w.trim();
-        let h = h.trim();
-        if !w.is_empty() || !h.is_empty() {
-            let size = if w.is_empty() {
-                format!("x{}", h)
-            } else if h.is_empty() {
-                format!("{}x", w)
+        if !w_txt.is_empty() || !h_txt.is_empty() {
+            let size = if w_txt.is_empty() {
+                format!("x{}", h_txt)
+            } else if h_txt.is_empty() {
+                format!("{}x", w_txt)
             } else {
-                format!("{}x{}", w, h)
+                format!("{}x{}", w_txt, h_txt)
             };
             cmd.extend(["-resize".into(), size]);
         }
-
-        if self.do_trim.is_active() {
+        if trim {
             cmd.extend([
                 "-fuzz".into(),
                 format!("{}%", self.fuzz.value().round() as i32),
@@ -333,46 +283,36 @@ impl CropTab {
                 "+repage".into(),
             ]);
         }
-
         if matches!(fmt, "jpg" | "webp") {
             cmd.extend(["-quality".into(), "92".into()]);
         }
-
         cmd.push(out.to_string_lossy().into_owned());
 
-        if commit {
-            // After a successful commit, update crop's own input to the
-            // result so the next drag's coordinates are in the right space.
-            let base_c = self.base.clone();
-            let tc = self.clone();
-            let app_c = app.clone();
-            let out_for_cb = out.clone();
-            let on_complete: Option<Rc<dyn Fn()>> = Some(Rc::new(move || {
-                base_c.set_input(Some(out_for_cb.clone()), None);
-                // The result is the new input, so the pending crop box / rotation / flips /
-                // resize are already applied: clear them (re-applying them was why a second
-                // "Process" appeared to do nothing).
+        // After success the result becomes this tool's input, so everything that referred to the old
+        // image's coordinates (the crop box) must be cleared, and the consumed settings reset.
+        let base_c = self.base.clone();
+        let tc = self.clone();
+        let app_c = app.clone();
+        let out_cb = out.clone();
+        let on_complete: Option<Rc<dyn Fn()>> = Some(Rc::new(move || {
+            base_c.set_input(Some(out_cb.clone()), None);
+            if ops & OP_ROTFLIP != 0 {
                 *tc.rotate_quarters.borrow_mut() = 0;
                 *tc.flip_h_state.borrow_mut() = false;
                 *tc.flip_v_state.borrow_mut() = false;
+            }
+            if ops & OP_ANGLE != 0 {
                 tc.angle.set_value(0.0);
+            }
+            if ops & OP_RESIZE != 0 {
                 tc.w_entry.set_text("");
                 tc.h_entry.set_text("");
-                app_c.preview.set_crop_overlay(None);
-                tc.crop_info
-                    .set_text("Drag on the preview to define a crop rectangle");
-            }));
-            self.base.clone().spawn_processing_with_callback(
-                app.clone(),
-                input,
-                out,
-                vec![cmd],
-                on_complete,
-            );
-        } else {
-            self.base
-                .clone()
-                .spawn_processing_preview(app.clone(), input, out, vec![cmd]);
-        }
+            }
+            app_c.preview.set_crop_overlay(None);
+            tc.crop_info.set_text(CROP_HINT);
+        }));
+        self.base
+            .clone()
+            .spawn_processing_with_callback(app.clone(), input, out, vec![cmd], on_complete);
     }
 }

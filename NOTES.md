@@ -11,7 +11,7 @@
 You are continuing a personal Linux desktop app called "File Tools" (Rust + GTK4). Read NOTES.md in the attached zip
 completely before doing anything. Then:
 
-1. Do NOT start coding yet. In 10 lines or fewer, tell me what you understood: what the app is, the current status
+1. If the owner has sent a **bug report**, that comes first (see §7 "Round 4c — Bug-fix round"). Do NOT start coding yet. In 10 lines or fewer, tell me what you understood: what the app is, the current status
    (§6), and which roadmap round is next (§7). Wait for my "go".
 2. When I say go, implement exactly the next round from §7 — nothing more. Respect §2 (limitations), §3 (build/test),
    §9 (conventions/pitfalls) and §10 (token-saving rules). Edit files in place and return ONE zip (no target/ folder).
@@ -56,6 +56,7 @@ CPU/battery use. The owner tests every zip by hand and reports back with screens
   full-resolution result is produced only on Save/Copy/tab switch/Process (see §5.3). The step appears in History only then.
 * **Not persisted yet:** History/pipeline is lost on exit (projects come in Round 5). Settings, themes, presets, tab layout are saved.
 * **No GUI test framework.** Logic is unit-tested (`cargo test`); UI is verified by headless screenshots.
+* **Default GTK widgets are still used** for the colour picker, dropdowns, switches, scrollbars and file dialogs. The owner wants these replaced by custom, themed widgets (see Round 4b).
 * **Only Adjust, Fill and Paperize use the fast proxy preview.** Others render at full resolution on every live tick.
 * The `next_page` "value assigned is never read" compiler warning in `app.rs` is a known harmless leftover of the `register_page!` macro.
 
@@ -105,13 +106,17 @@ cargo-1.91 …`; background installs die when the shell call ends — run them i
 | `util.rs` | `run_capture`, `resolve_font`, `image_dimensions` (header-only fast path), `preview_proxy` (1280 px cached copy), clipboard, colour math, palette extraction, done-sound |
 | `config.rs` | paths: config dir, tmp files, save dir `~/Pictures/FileTools`, bg-remover binaries |
 
-### UI layout (v9)
+### UI layout (v10)
 ```
-menubar (File Edit View Tools Help)
-toolbar:  [Open][Paste][Undo][Redo]  [filename ………………]  [Save As][Copy][Reset][Tabs][Settings]   (big icon+label buttons)
-┌ rail (tool icons, grouped) ┬ canvas (zoom bar + preview + fade slider) ┬ right dock: tool settings (top) / HISTORY (bottom) ┐
-status bar: size · zoom · cursor x,y · ………………………… N steps (· "preview not applied yet")
+toolbar:  [Open][Recent▾][Paste][Undo][Redo]  [filename ………………]  [Save As][Copy][Reset][Tabs][Settings]   (big icon+label buttons)
+┌ toolbox ─────┬ canvas (preview, checkerboard behind transparency, fade slider at the bottom) ┬ right dock: tool settings / HISTORY ┐
+│ ↔ size btn   │                                                                                  │                                      │
+│ icon grid    │                                                                                  │                                      │
+status bar:  size · cursor x,y · ………………… [− 100% + Fit 1:1] · N steps (· "preview not applied yet")
 ```
+* **No menu bar** (owner asked for it to be removed). `menus.rs` still registers every `win.*` action + accelerators (Ctrl+O/S/Q, zoom keys) and builds the *Open Recent* model that the toolbar **Recent** button shows.
+* **Toolbox** = icon-only `FlowBox` (no text, no group headers). The `↔` button cycles 3 sizes (small 1 column / medium 2 columns / large 2 columns + names); stored in `Settings.toolbox_size`. Tool visibility from the Tabs popover is applied with a `FlowBox` filter (`AppState.rail_hidden` + `refresh_rail_groups`). If SVG icons are unavailable the names are shown instead.
+* **Zoom controls** (`Preview.controls`) are hosted in the status bar, not on the canvas.
 
 ---------------------------------------------------------------------------------------------------
 
@@ -169,17 +174,32 @@ The settings popover is `autohide(false)` and closes via ✕, Esc, click-outside
   Output canvas can be larger than the input. Noise coordinates use "real" pixels (`x/scale`) so preview == final.
 * **Remove:** rembg/backgroundremover via absolute venv paths; sound-when-done is a *global* setting (Settings → Sound).
 
+### 5.9 Transparent PNG/WebP handling (owner priority)
+* Hidden colours under fully transparent pixels are cleared on load: `util::sanitize_transparency` (header check for an alpha channel → copy with RGB zeroed, keeps the file name, written under the tmp dir) is called from `AppState::set_universal_input`. RemBg output is cleaned by the internal job step `@clean-alpha` (handled in `BaseTab::spawn_impl`, Rust, exact; **do not use ImageMagick `-alpha associate/disassociate` — it corrupts alpha**).
+* Tools must still be alpha-aware (Halftone/ASCII/Duotone/Paperize are). **Not yet audited with transparent input:** Pixelate, Outline, Watermark, Palette, Fill Background, Convert — put this in the bug-fix round.
+
+### 5.10 Canvas compositing & fade slider
+Layers: checkerboard → original (opaque) → *(result over its own checkerboard)* painted at `fade` opacity. That is a true crossfade original↔result, so removed backgrounds fade out through the checkerboard (no jump at 100%). The slider shows for the tools in `FADE_TABS`.
+
+### 5.11 Crop & Transform (v10)
+No generic Process button. Rotate/flip buttons apply immediately; "Rotate by angle", "Crop to selection", "Resize" and "Trim empty borders" each apply their own operation via `run_ops(ops_mask)`; every action = one History step; the crop overlay and consumed settings are cleared afterwards; Ctrl+Enter = crop to selection. No live preview for this tool.
+
+### 5.12 Paperize silhouette
+The torn border is built from a signed distance field of the image's alpha (`signed_distance`, Felzenszwalb EDT): a cut-out PNG gets a border hugging its real outline, transparent areas stay transparent, an opaque photo is a rounded rectangle. Style 1 erodes the subject instead. Crumple shading on paper; weathering on everything.
+
 ---------------------------------------------------------------------------------------------------
 
 ## 6. Status (update every session)
 
-**Done (v1 → v9):** Rust port; pipeline + undo/redo; 5 themes with orange modified sliders; icon rail; launcher/CLI open; proxy preview (Adjust, Fill, Paperize);
-halftone/ASCII bases + ASCII un-stretch; transparency-aware Halftone; Paperize v2; Crop commit bug fixed; step records; **v9 UI shell: menu bar, big-button toolbar with Undo/Redo,
-History dock (rollback list), status bar (size/zoom/cursor/steps), File ▸ Open Recent; old bottom chip strip and saved-files list removed.**
+**Done (v1 → v10):** Rust port; pipeline + undo/redo; 5 themes; orange "modified" sliders; launcher/CLI; proxy preview (Adjust, Fill, Paperize); halftone/ASCII bases; Paperize (torn border around the real silhouette + weathering + crumple);
+History dock with rollback; status bar; **v10: menu bar removed; icon-only toolbox with size button; zoom controls in the status bar; Recent button; Crop rebuilt as direct actions; true crossfade fade slider (+ slider enabled for all effect tools);
+transparent PNG/WebP clean-up on load and after RemBg; History panel styled explicitly (white theme).**
 
-**Untested by the owner:** v8 and v9 (owner will test v9, which includes v8). Unit tests: 8 pass (+2 ignored perf/sample tests).
+**Untested by the owner:** v10 (owner tests this one; v8/v9 were skipped). Unit tests: 10 pass (+2 ignored).
 
-**Open / unverified:** Wayland behaviour of popups/menus; Pixelate/Outline/Watermark with transparent input; the new menu bar on Hyprland; `librsvg` presence on the owner's system.
+**Owner said:** a detailed bug report is coming after v10 — *fix bugs before adding features*. Also: "PLEASE FIX PNGS AND WEBP" — tools affecting transparent pixels; see §5.9 audit list.
+
+**Open / unverified:** Wayland behaviour (popups, Recent menu button); `librsvg` on the owner's system; the History list colour on the owner's newer GTK (now styled explicitly, unverified there); Pixelate/Outline/Watermark/Palette/Fill/Convert with transparent input.
 
 ---------------------------------------------------------------------------------------------------
 
@@ -187,16 +207,16 @@ History dock (rollback list), status bar (size/zoom/cursor/steps), File ▸ Open
 
 **Why this order:** history, projects, recents and recipes all need "every step recorded with tool + settings" (done). The UI is built on top of that.
 
-### Round 4 — Tool blocks, customisation, finish the shell  *(NEXT)*
-Goal: fix the tab clutter. Replace the per-tab toggles ("Tabs" menu) with **category blocks** the owner can organise.
-* Left rail = blocks (Isolate, Adjust, Color, Effects, Style, Utility, + user-created). Each block has a header and large icon buttons.
-* **Drag to reorder blocks and tools**, including moving a tool between blocks (GTK4 `DragSource`/`DropTarget`). Persist order/membership/visibility in `settings.json`/`Layout`
-  (new fields must default sanely; unknown/new tools appear at the end of their default block).
-* "Customize" mode (button/menu): show/hide tools, rename/add/delete blocks. A **Find tool** search box (filters the rail and the Tools menu) and optional pinned favourites.
-* Remove the `Tabs ▾` toolbar button and the old tab-visibility popover once Customize works.
-* History panel: clicking a step should also **restore that tool's controls from `HistoryEntry.params`** (the tab's `apply_preset_data`-style function) when it makes sense.
-* Tool-options bar: slim row under the toolbar showing the active tool's icon+name and Process/Reset/Presets (inspector keeps the full controls).
-* Acceptance: reorder survives a restart; hidden tools disappear from rail+menu; Ctrl+Z/History still work; no regression in themes (test dark/black/white).
+### Round 4c — Bug-fix round  *(NEXT — do this before anything else)*
+Owner will send a bug report after testing v10. Fix everything in it, add a regression test or screenshot check for each, and finish the **transparent-PNG/WebP audit** of every tool (§5.9).
+
+### Round 4 (revised) — Panels & shell polish
+The toolbox is done in v10 (simple icon grid, size button). Remaining, in the paint.net spirit: small **movable/collapsible panels** (History, tool settings; title bar with collapse/close, drag to dock left/right/float),
+tool-options bar under the toolbar (active tool name + quick actions), drag-to-reorder tools inside the toolbox (optional, persisted), hide/show tools without the old Tabs popover (then delete it),
+and clicking a History step restores that tool's controls from `HistoryEntry.params`.
+
+### Round 4b — Custom widgets (owner request)
+Stop using default GTK widgets where they look wrong/out of place: build a **custom colour picker** (paint.net "Colors" panel: wheel/square, hex, RGB/HSV, primary/secondary swatches, eyedropper), themed dropdowns/switches/sliders and scrollbars, and a themed file dialog. Do this as shared widgets in `widgets/` and replace usages incrementally.
 
 ### Round 5 — Files & projects
 * Rename/replace the old saved-files list with **Recent files** (menu already exists; add a dock/list if useful) and **Projects = folders** under `~/Pictures/FileTools/`.
@@ -232,6 +252,7 @@ loading another PDF; batch load. Implement with `qpdf` + `pdftoppm`. Extras by p
 ---------------------------------------------------------------------------------------------------
 
 ## 8. CLEANUP / THINGS TO CHANGE (do when touching the area)
+* `menus::install` still returns an unused `PopoverMenuBar` (menu bar was removed from the window); keep the actions, drop the widget code when convenient. `rail_group_headers/rail_group_tabs` fields are unused now.
 * After Round 4 remove: `Tabs ▾` button + popover, `Layout::is_enabled` UI, unused `strip_box`/`refresh_strip` chip code, `history_list`/`refresh_history` (replaced by Recent menu), `hist-pane` CSS.
 * `refresh_strip()` is now just a trigger for `refresh_panels()` — rename it.
 * Presets for Paperize/Halftone store dropdown *indices*; changing option order breaks old presets — consider storing names.
@@ -269,6 +290,8 @@ loading another PDF; batch load. Implement with `qpdf` + `pdftoppm`. Extras by p
 * Scope target for editing = "paint.net-lite", not Krita/GIMP.
 
 ## 12. Changelog
+* **v10** — menu bar removed; icon-only toolbox with 3 sizes; zoom controls in the status bar; Recent button; Crop rebuilt (single-purpose actions, no Process button); fade slider = true crossfade and shown for all effect tools;
+  Paperize border follows the subject silhouette (EDT) + crumple; transparent PNG/WebP clean-up (`sanitize_transparency`, `@clean-alpha`); History panel explicit colours; toolbox_size setting.
 * **v9** — UI shell: menu bar (File/Edit/View/Tools/Help, shortcuts, Open Recent), big icon toolbar with Undo/Redo, History dock with click-to-rollback (future steps dimmed), status bar
   (size/zoom/cursor/steps), `tools/interact.sh`, expanded NOTES. Old bottom chips + saved-files list removed.
 * **v8** — Paperize rewritten (torn paper border + weathering); history entries carry `params` + `live`; undo fixes; Crop commit fix; Halftone transparency fix.

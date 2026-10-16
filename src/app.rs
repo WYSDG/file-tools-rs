@@ -63,7 +63,18 @@ const TAB_NAMES: &[&str] = &[
     "Watermark",
 ];
 
-const FADE_TABS: &[&str] = &["Remove", "Adjust", "Duotone", "Pixelate", "Paperize", "Watermark"];
+const FADE_TABS: &[&str] = &[
+    "Remove",
+    "Adjust",
+    "Fill Background",
+    "Duotone",
+    "Halftone",
+    "ASCII",
+    "Pixelate",
+    "Paperize",
+    "Outline",
+    "Watermark",
+];
 
 #[derive(Clone)]
 pub struct HistoryEntry {
@@ -98,6 +109,9 @@ pub struct AppState {
     pub theme_provider: Rc<RefCell<Option<gtk::CssProvider>>>,
     pub rail_group_headers: Rc<RefCell<HashMap<String, Label>>>,
     pub rail_group_tabs: Rc<RefCell<HashMap<String, Vec<String>>>>,
+    /// The toolbox grid and the tools currently hidden by the layout settings.
+    pub rail_flow: Rc<RefCell<Option<gtk::FlowBox>>>,
+    pub rail_hidden: Rc<RefCell<std::collections::HashSet<String>>>,
     /// A live preview that has been shown but not yet committed at full resolution.
     pub pending_commit: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     /// Bumped whenever pending work is finalized or dropped, so late preview results are ignored.
@@ -529,6 +543,8 @@ impl AppState {
 
     pub fn set_universal_input(&self, path: Option<PathBuf>) {
         self.drop_pending();
+        // Clear colours hidden under transparent PNG/WebP pixels so no tool "sees" them.
+        let path = path.map(|p| crate::util::sanitize_transparency(&p).unwrap_or(p));
         *self.initial_load.borrow_mut() = path.clone();
         self.history.borrow_mut().clear();
         *self.current_result.borrow_mut() = None;
@@ -735,15 +751,17 @@ impl AppState {
         }
     }
 
+    /// Re-apply which tools are shown in the toolbox (after the layout settings changed).
     pub fn refresh_rail_groups(&self) {
         let layout = Layout::load();
-        let headers = self.rail_group_headers.borrow();
-        let groups = self.rail_group_tabs.borrow();
-        for (grp, tabs) in groups.iter() {
-            let any = tabs.iter().any(|t| layout.is_enabled(t));
-            if let Some(hdr) = headers.get(grp) {
-                hdr.set_visible(any);
-            }
+        let hidden: std::collections::HashSet<String> = TAB_NAMES
+            .iter()
+            .filter(|n| !layout.is_enabled(n))
+            .map(|n| n.to_string())
+            .collect();
+        *self.rail_hidden.borrow_mut() = hidden;
+        if let Some(f) = self.rail_flow.borrow().as_ref() {
+            f.invalidate_filter();
         }
     }
 
@@ -783,6 +801,15 @@ pub fn run() {
     app.connect_activate(build_ui);
     // We parse the file argument ourselves, so don't let GTK reject it.
     app.run_with_args::<&str>(&[]);
+}
+
+/// Width of the toolbox column for a size mode.
+fn toolbox_width(mode: u32) -> i32 {
+    match mode {
+        0 => 62,
+        2 => 156,
+        _ => 112,
+    }
 }
 
 /// File chooser for opening an image (toolbar button and File menu).
@@ -870,6 +897,8 @@ fn build_ui(app: &Application) {
         theme_provider: Rc::new(RefCell::new(None)),
         rail_group_headers: Rc::new(RefCell::new(HashMap::new())),
         rail_group_tabs: Rc::new(RefCell::new(HashMap::new())),
+        rail_flow: Rc::new(RefCell::new(None)),
+        rail_hidden: Rc::new(RefCell::new(std::collections::HashSet::new())),
     };
 
     // Install the initial theme and keep the provider so we can swap it
@@ -1231,54 +1260,66 @@ fn build_ui(app: &Application) {
         );
     }
 
-    // ---------- Rail ----------
-    let rail = GtkBox::new(Orientation::Vertical, 2);
-    rail.set_margin_top(6);
-    rail.set_margin_bottom(6);
-    rail.set_margin_start(4);
-    rail.set_margin_end(4);
-    rail.set_size_request(84, -1);
-    rail.add_css_class("rail-pane");
+    // ---------- Toolbox (icon buttons, paint.net style) ----------
+    let toolbox = GtkBox::new(Orientation::Vertical, 6);
+    toolbox.set_margin_top(6);
+    toolbox.set_margin_bottom(6);
+    toolbox.set_margin_start(4);
+    toolbox.set_margin_end(4);
+    toolbox.add_css_class("rail-pane");
 
+    let size_btn = Button::new();
+    size_btn.add_css_class("flat");
+    size_btn.set_halign(gtk::Align::Center);
+    size_btn.set_tooltip_text(Some("Resize the toolbox (small / medium / large)"));
+    match crate::icons::ui_icon("resize") {
+        Some(icon) => size_btn.set_child(Some(&gtk::Image::from_icon_name(icon))),
+        None => size_btn.set_label("↔"),
+    }
+    toolbox.append(&size_btn);
+
+    let flow = gtk::FlowBox::new();
+    flow.set_selection_mode(gtk::SelectionMode::None);
+    flow.set_homogeneous(true);
+    flow.set_row_spacing(3);
+    flow.set_column_spacing(3);
+    flow.set_focusable(false);
+    flow.set_valign(gtk::Align::Start);
+    {
+        let hidden = app_state.rail_hidden.clone();
+        flow.set_filter_func(move |child| {
+            child
+                .child()
+                .map(|c| !hidden.borrow().contains(c.widget_name().as_str()))
+                .unwrap_or(true)
+        });
+    }
+    toolbox.append(&flow);
+    *app_state.rail_flow.borrow_mut() = Some(flow.clone());
+
+    let visuals: Rc<RefCell<Vec<(gtk::ToggleButton, Option<gtk::Image>, Label)>>> =
+        Rc::new(RefCell::new(Vec::new()));
     let mut group: Option<gtk::ToggleButton> = None;
-    let mut current_group = String::new();
 
-    for (tab, short, tooltip, grp) in RAIL_LAYOUT {
-        if *grp != current_group {
-            current_group = grp.to_string();
-            let hdr = Label::new(Some(&grp.to_uppercase()));
-            hdr.set_xalign(0.0);
-            hdr.add_css_class("section-label");
-            hdr.set_margin_top(6);
-            hdr.set_margin_start(4);
-            rail.append(&hdr);
-            app_state
-                .rail_group_headers
-                .borrow_mut()
-                .insert(grp.to_string(), hdr);
-        }
-        app_state
-            .rail_group_tabs
-            .borrow_mut()
-            .entry(grp.to_string())
-            .or_default()
-            .push(tab.to_string());
-
+    for (tab, short, tooltip, _grp) in RAIL_LAYOUT {
         let btn = gtk::ToggleButton::new();
         let inner = Label::new(Some(short));
+        inner.add_css_class("caption");
         inner.set_ellipsize(gtk::pango::EllipsizeMode::End);
         let content = GtkBox::new(gtk::Orientation::Vertical, 1);
         content.set_halign(gtk::Align::Center);
-        if let Some(icon) = crate::icons::tab_icon(tab) {
+        content.set_valign(gtk::Align::Center);
+        let img = crate::icons::tab_icon(tab).map(|icon| {
             let img = gtk::Image::from_icon_name(icon);
-            img.set_pixel_size(20);
             content.append(&img);
-        }
+            img
+        });
         content.append(&inner);
         btn.set_child(Some(&content));
         btn.add_css_class("flat");
         btn.add_css_class("rail-btn");
         btn.set_tooltip_text(Some(tooltip));
+        btn.set_widget_name(tab);
 
         if let Some(g) = group.as_ref() {
             btn.set_group(Some(g));
@@ -1305,11 +1346,38 @@ fn build_ui(app: &Application) {
             state.preview.set_crop_mode(tab_name_s == "Crop");
         });
 
+        visuals.borrow_mut().push((btn.clone(), img, inner));
         rail_buttons
             .borrow_mut()
             .insert(tab.to_string(), btn.clone());
-        rail.append(&btn);
+        flow.append(&btn);
     }
+
+    // Size modes: 0 small (1 column), 1 medium (2 columns), 2 large (2 columns + names).
+    let apply_size: Rc<dyn Fn(u32)> = {
+        let flow = flow.clone();
+        let visuals = visuals.clone();
+        Rc::new(move |mode: u32| {
+            let (cols, px, bw, bh, labels) = match mode {
+                0 => (1u32, 18, 38, 38, false),
+                2 => (2, 28, 66, 58, true),
+                _ => (2, 22, 48, 46, false),
+            };
+            flow.set_min_children_per_line(1);
+            flow.set_max_children_per_line(cols);
+            flow.set_min_children_per_line(cols);
+            for (btn, img, lbl) in visuals.borrow().iter() {
+                btn.set_size_request(bw, bh);
+                if let Some(i) = img {
+                    i.set_pixel_size(px);
+                }
+                // Without an icon the name is the only thing identifying the tool.
+                lbl.set_visible(labels || img.is_none());
+            }
+        })
+    };
+    let initial_toolbox = app_state.settings.borrow().toolbox_size.min(2);
+    apply_size(initial_toolbox);
 
     if let Some(first) = rail_buttons.borrow().get("Remove").cloned() {
         first.set_active(true);
@@ -1319,7 +1387,7 @@ fn build_ui(app: &Application) {
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
         .build();
-    rail_scroll.set_child(Some(&rail));
+    rail_scroll.set_child(Some(&toolbox));
     rail_scroll.add_css_class("rail-pane");
 
     // ---------- Center canvas ----------
@@ -1368,6 +1436,12 @@ fn build_ui(app: &Application) {
         });
     }
     top_bar.append(&choose_btn);
+    let recent_btn = gtk::MenuButton::new();
+    recent_btn.add_css_class("tool-btn");
+    recent_btn.add_css_class("flat");
+    recent_btn.set_tooltip_text(Some("Recently saved images"));
+    recent_btn.set_child(Some(&big_content("recent", "Recent")));
+    top_bar.append(&recent_btn);
 
     let paste_btn = big_button("paste", "Paste", "Paste an image from the clipboard (Ctrl+V)");
     {
@@ -1510,7 +1584,12 @@ fn build_ui(app: &Application) {
             Rc::new(move || open_image_dialog(&st, Some(w.clone().upcast())))
         },
     );
-    main.append(&menubar);
+    // The menu bar is intentionally not shown (the toolbar covers it); its actions and keyboard
+    // shortcuts stay registered, and "Recent" lives in the toolbar.
+    let _menubar = menubar;
+    if let Some(m) = app_state.recent_menu.borrow().as_ref() {
+        recent_btn.set_menu_model(Some(m));
+    }
     main.append(&top_bar);
 
     // Middle
@@ -1566,11 +1645,26 @@ fn build_ui(app: &Application) {
     dock.set_shrink_end_child(false);
     right_paned.set_end_child(Some(&dock));
 
-    middle.set_position(160);
+    middle.set_position(toolbox_width(initial_toolbox));
     right_paned.set_position(800);
 
     middle.set_end_child(Some(&right_paned));
     main.append(&middle);
+    {
+        let m = middle.clone();
+        let apply = apply_size.clone();
+        let st = app_state.clone();
+        size_btn.connect_clicked(move |_| {
+            let next = {
+                let mut s = st.settings.borrow_mut();
+                s.toolbox_size = (s.toolbox_size + 1) % 3;
+                s.save();
+                s.toolbox_size
+            };
+            apply(next);
+            m.set_position(toolbox_width(next));
+        });
+    }
 
     {
         let m = middle.clone();
@@ -1586,7 +1680,7 @@ fn build_ui(app: &Application) {
             if width < 300 {
                 return;
             }
-            let rail_w = (width as f64 * 0.13).max(90.0) as i32;
+            let rail_w = toolbox_width(initial_toolbox);
             m.set_position(rail_w);
             let remaining = width - rail_w;
             if remaining > 200 {
@@ -1601,13 +1695,6 @@ fn build_ui(app: &Application) {
     status.add_css_class("status-bar");
     status.set_margin_start(2);
     let size_lbl = Label::new(Some("No image"));
-    let zoom_lbl = Label::new(Some("100%"));
-    app_state
-        .preview
-        .zoom_lbl
-        .bind_property("label", &zoom_lbl, "label")
-        .sync_create()
-        .build();
     let pos_lbl = Label::new(None);
     pos_lbl.set_width_chars(16);
     pos_lbl.set_xalign(0.0);
@@ -1619,13 +1706,19 @@ fn build_ui(app: &Application) {
         }));
     }
     let steps_lbl = Label::new(Some("0 steps"));
-    steps_lbl.set_hexpand(true);
     steps_lbl.set_xalign(1.0);
+    steps_lbl.set_margin_start(14);
     steps_lbl.set_margin_end(10);
-    for l in [&size_lbl, &zoom_lbl, &pos_lbl] {
+    for l in [&size_lbl, &pos_lbl] {
         l.set_margin_start(8);
         status.append(l);
     }
+    // Zoom controls live here (out of the canvas, like paint.net's bottom-right zoom box).
+    let zoom_box = app_state.preview.controls.clone();
+    zoom_box.add_css_class("status-zoom");
+    zoom_box.set_hexpand(true);
+    zoom_box.set_halign(gtk::Align::End);
+    status.append(&zoom_box);
     status.append(&steps_lbl);
     *app_state.ui_refs.borrow_mut() = Some(UiRefs {
         size_lbl,

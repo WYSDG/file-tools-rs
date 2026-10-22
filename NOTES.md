@@ -11,7 +11,7 @@
 You are continuing a personal Linux desktop app called "File Tools" (Rust + GTK4). Read NOTES.md in the attached zip
 completely before doing anything. Then:
 
-1. If the owner has sent a **bug report**, that comes first (see §7 "Round 4c — Bug-fix round"). Do NOT start coding yet. In 10 lines or fewer, tell me what you understood: what the app is, the current status
+1. Read §7.0 (bug-report triage) and §13 (the current "next prompt"). Do NOT start coding yet. In 10 lines or fewer, tell me what you understood: what the app is, the current status
    (§6), and which roadmap round is next (§7). Wait for my "go".
 2. When I say go, implement exactly the next round from §7 — nothing more. Respect §2 (limitations), §3 (build/test),
    §9 (conventions/pitfalls) and §10 (token-saving rules). Edit files in place and return ONE zip (no target/ folder).
@@ -56,6 +56,8 @@ CPU/battery use. The owner tests every zip by hand and reports back with screens
   full-resolution result is produced only on Save/Copy/tab switch/Process (see §5.3). The step appears in History only then.
 * **Not persisted yet:** History/pipeline is lost on exit (projects come in Round 5). Settings, themes, presets, tab layout are saved.
 * **No GUI test framework.** Logic is unit-tested (`cargo test`); UI is verified by headless screenshots.
+* **GTK4 has no global "disable tooltips" switch** — `settings_panel::apply_tooltips` walks the widget tree (call it again after creating new tooltip-bearing widgets). Rounded popover corners only look right with a compositing window manager (Wayland yes; the Xvfb/openbox test setup shows black corners — not a bug).
+* **WebP export:** the `image` crate only writes lossless WebP; lossy quality goes through ImageMagick (`magick -quality`) with a lossless fallback.
 * **Default GTK widgets are still used** for the colour picker, dropdowns, switches, scrollbars and file dialogs. The owner wants these replaced by custom, themed widgets (see Round 4b).
 * **Only Adjust, Fill and Paperize use the fast proxy preview.** Others render at full resolution on every live tick.
 * The `next_page` "value assigned is never read" compiler warning in `app.rs` is a known harmless leftover of the `register_page!` macro.
@@ -187,69 +189,61 @@ No generic Process button. Rotate/flip buttons apply immediately; "Rotate by ang
 ### 5.12 Paperize silhouette
 The torn border is built from a signed distance field of the image's alpha (`signed_distance`, Felzenszwalb EDT): a cut-out PNG gets a border hugging its real outline, transparent areas stay transparent, an opaque photo is a rounded rectangle. Style 1 erodes the subject instead. Crumple shading on paper; weathering on everything.
 
+### 5.13 Document core (v11) — "what is the current image?"
+* **`AppState::current_head()` is the single source of truth** (last History step, else the opened file). Save As, Copy, the status bar and tool inputs all use it. (`current_result` is legacy; don't use it.)
+* `open_path()` = new document (Open, Recent, Paste): history **and redo** are cleared, the file-name box resets. `reset_to_original()` pushes an **undoable "Reset" step** (output = the original file); Ctrl+Z brings the edits back.
+* `sync_tool_inputs()` (after Undo/Redo/History click): every tool gets the head as input, **except the active tool when the head step was made by that tool** — then it gets that step's *own input* (previous step) and its controls are restored from `HistoryEntry.params` via `BaseTab::apply_preset_quiet` (no re-render). This fixed Paperize stacking on itself. `HistoryEntry.tool` = tab that produced the step.
+* **File name box:** `set_name_auto()` keeps it in sync with the pipeline until the owner types a name (`name_edited`), then tools stop overwriting it. Opening a new document resets it. Enter/click-away drops focus.
+* **Focus:** a window-level click gesture clears keyboard focus after any click that isn't on a text field (no lingering blue highlight); button focus outlines are removed in CSS.
+* **Toasts (`toast.rs`):** `app.toast("msg")` and `app.toast_actions(msg, [(label, cb)…], secs)` (used for the ✓ Overwrite / ✕ confirmation). Use them for every user action that has no visible result.
+* **Save As (`save_dialog.rs` + `export.rs`):** name, folder, PNG/JPEG/WebP, quality (default 100), optional resize with ratio lock; always saves the head, even with zero steps; overwrite asks via toast when "Ask before overwriting" is on; honours the exiftool metadata settings. The old **Convert tool is to be removed** (its job is now this dialog) — not done yet.
+* Settings now wired: *Show tooltips*, *Default AI model* (`AppState.on_default_model` → `RemoveTab::select_model_key`).
+* Sliders (`BaseTab::tracked_slider`) pass plain scroll to the page; Ctrl+scroll adjusts them.
+
+### 5.14 AI plan (decided with the owner — implement in "AI v2")
+Python/rembg is slow because every run starts a new Python process, imports onnxruntime and reloads the model. The models are plain ONNX files, so run them **in-process from Rust with ONNX Runtime (`ort` crate, `load-dynamic`)**, keep sessions in memory (load in the background at startup), cap CPU threads (4–6) for laptop heat. No GPU (AMD iGPU unsupported).
+* **System dependency (owner approved):** ONNX Runtime from the distro (`sudo pacman -S onnxruntime` — *verify the exact package/version*; `ort` 2.0.0-rc.x expects a matching ORT major/minor; pin versions). **Must appear in the README.**
+* **Models** (downloaded on first use into `~/.local/share/file-tools/models/`, SHA-256 verified, progress toast; the Settings list must show ALL of these by default so any can be downloaded):
+  | Purpose | Model | Size | License |
+  |---|---|---|---|
+  | Auto cutout, **default** | silueta | ~42 MB | Apache-2.0 |
+  | Auto cutout, small/fast | u2netp | ~5 MB | Apache-2.0 |
+  | Auto cutout, sharper | isnet-general-use | ~170 MB | Apache-2.0 |
+  | Auto cutout, best (optional) | BiRefNet-lite | ~214 MB | MIT |
+  | Click/box/brush object selection | MobileSAM (encoder ≈27 MB + decoder ≈16 MB) | ~60 MB | Apache-2.0 |
+  (Sizes/licenses come from rembg/MobileSAM/samexporter listings — **re-verify each license file before publishing**.)
+* **Do not commit weights to git** (GitHub 100 MB file limit). Ship `models/manifest.json` {id, url, sha256, size, license, purpose}; host files as GitHub Release assets or link the original sources; include each model's LICENSE/NOTICE text in the repo. Project license: **MIT** (`LICENSE`).
+* **UX:** Mode = *AI Mask* (default; auto-detect, then click/box/brush to add or subtract; refine edges with matting) or *Erase*. No mask → whole-image background removal. Mask is a toggleable overlay on the main canvas (the small preview in the Remove tab goes away). Reset must reset brush size.
+* MobileSAM: encode the image once (≈1–3 s on CPU, estimate), then each prompt returns a mask almost instantly (decoder). Models can be tested in the sandbox (rembg's release assets and PyPI's `onnxruntime` wheel are reachable).
+
+### 5.15 README to-do (write later, keep this list current)
+Install/build (`./cool.sh`, `./install.sh`), **system packages**: ImageMagick 7, wl-clipboard, sox, exiftool, qpdf, poppler (pdftoppm), librsvg, **onnxruntime**, fontconfig; first-run model downloads + manifest; supported formats; keyboard shortcuts; screenshots; license (MIT) + third-party licenses (Phosphor, model licenses); how to report bugs.
+
 ---------------------------------------------------------------------------------------------------
 
 ## 6. Status (update every session)
 
-**Done (v1 → v10):** Rust port; pipeline + undo/redo; 5 themes; orange "modified" sliders; launcher/CLI; proxy preview (Adjust, Fill, Paperize); halftone/ASCII bases; Paperize (torn border around the real silhouette + weathering + crumple);
-History dock with rollback; status bar; **v10: menu bar removed; icon-only toolbox with size button; zoom controls in the status bar; Recent button; Crop rebuilt as direct actions; true crossfade fade slider (+ slider enabled for all effect tools);
-transparent PNG/WebP clean-up on load and after RemBg; History panel styled explicitly (white theme).**
+**Done (v1 → v11):** see §12. **v11 = Round 1 "Core v2"**: single source of truth for the current image, Save As dialog (+export engine), undoable Reset, Recent popover list, toasts, file-name box rules, tool-input fix after Undo (Paperize stacking), restored settings on History navigation, focus-highlight fix, tooltips + default-AI-model settings wired, slider scroll fix, MIT license.
 
-**Untested by the owner:** v10 (owner tests this one; v8/v9 were skipped). Unit tests: 10 pass (+2 ignored).
+**Untested by the owner:** v11. Unit tests: 12 pass (+2 ignored).
 
-**Owner said:** a detailed bug report is coming after v10 — *fix bugs before adding features*. Also: "PLEASE FIX PNGS AND WEBP" — tools affecting transparent pixels; see §5.9 audit list.
+**Known/unfinished from the owner's bug report:** everything in §7.0 marked "Planned".
 
-**Open / unverified:** Wayland behaviour (popups, Recent menu button); `librsvg` on the owner's system; the History list colour on the owner's newer GTK (now styled explicitly, unverified there); Pixelate/Outline/Watermark/Palette/Fill/Convert with transparent input.
+**Open / unverified:** Wayland behaviour; rounded popover corners on a real compositor; `librsvg` on the owner's system; History list colour on the owner's newer GTK.
 
 ---------------------------------------------------------------------------------------------------
 
-## 7. ROADMAP — do exactly one round per session; each round ends with one zip for the owner to test
+## 7. ROADMAP — one round per session; each round ends with one zip for the owner to test
 
-**Why this order:** history, projects, recents and recipes all need "every step recorded with tool + settings" (done). The UI is built on top of that.
-
-### Round 4c — Bug-fix round  *(NEXT — do this before anything else)*
-Owner will send a bug report after testing v10. Fix everything in it, add a regression test or screenshot check for each, and finish the **transparent-PNG/WebP audit** of every tool (§5.9).
-
-### Round 4 (revised) — Panels & shell polish
-The toolbox is done in v10 (simple icon grid, size button). Remaining, in the paint.net spirit: small **movable/collapsible panels** (History, tool settings; title bar with collapse/close, drag to dock left/right/float),
-tool-options bar under the toolbar (active tool name + quick actions), drag-to-reorder tools inside the toolbox (optional, persisted), hide/show tools without the old Tabs popover (then delete it),
-and clicking a History step restores that tool's controls from `HistoryEntry.params`.
-
-### Round 4b — Custom widgets (owner request)
-Stop using default GTK widgets where they look wrong/out of place: build a **custom colour picker** (paint.net "Colors" panel: wheel/square, hex, RGB/HSV, primary/secondary swatches, eyedropper), themed dropdowns/switches/sliders and scrollbars, and a themed file dialog. Do this as shared widgets in `widgets/` and replace usages incrementally.
-
-### Round 5 — Files & projects
-* Rename/replace the old saved-files list with **Recent files** (menu already exists; add a dock/list if useful) and **Projects = folders** under `~/Pictures/FileTools/`.
-* **Save As** dialog: choose *default folder* / *existing project* / *new project*, name, format.
-* **Project file** (`.ftproj`, a zip like paint.net's `.pdn`): `manifest.json` {version, app version, steps:[{tool, label, params}], current_step}, `original.<ext>` (embedded copy),
-  optional cached step outputs, `thumb.png`, `result.png`. "Save Project" button writes it next to the exported image. Opening a project restores History and lets the owner roll back and re-edit.
-  Replay = apply each step's `params` to its tool in order (reuses the preset mechanism). Add a schema `version` for forward compatibility.
-* Persist the pipeline across restarts (optional "restore last session").
-
-### Round 6 — Proper AI masking (not an eraser!)
-Owner's explicit requirement: *"don't just paint a colour and delete everything in there"*. Design:
-1. AI proposes a mask (rembg with `-om`, alpha-matting flags `-a -ae -af -ab` are already supported).
-2. On the main canvas the owner paints **Keep** (green) / **Remove** (red) hints. Hints are *constraints that guide the AI*: build a **trimap** from the AI mask + hints and
-   re-run alpha matting (pymatting via rembg) on the uncertain band so edges stay clean. Hints never delete pixels directly.
-3. The mask is its own layer shown as an overlay (invert, grow/shrink, feather, opacity). Then apply: remove background / keep subject / blur background / crop to subject.
-4. Keep the plain **Eraser/Restore brush** as a separate, clearly named tool.
-5. Later options: SAM point/box prompts (`rembg -m sam -x`, large model download); object **inpainting** (separate tool, big model).
-* Replace `widgets/mask_canvas.rs` usage in the Remove tab. Mask strokes live in image coordinates; store the mask as a PNG in the project.
-
-### Round 7 — Recipes, batch, drag-and-drop
-Save a whole pipeline (list of tool + params) as a recipe; run it on a folder (background thread, progress, CPU-capped); drag files onto the window; multi-file open.
-
-### Round 8 — PDF workspace
-A separate workspace (pages, not one image) sharing toolbar/Recent/Projects. Page grid with thumbnails; select, delete, extract, **reorder by drag**, merge, split, rotate; "replace or load alongside?" when
-loading another PDF; batch load. Implement with `qpdf` + `pdftoppm`. Extras by priority: images↔PDF, compress (ghostscript), protect/unlock, page numbers/watermark, OCR (tesseract), metadata strip.
-
-### Later / ongoing
-* Engine: more tabs on the proxy preview; in-memory image buffers; then layers + pixel tools ("paint.net-lite": brush/eraser, selections, transforms, undo by pixel diffs, OpenRaster project format).
-* Battery/CPU: no idle redraws/timers, lower thread priority, in-process effects instead of subprocesses.
-* Paperize v3: seed/shuffle, per-edge control, corner folds, tape/pins, custom paper colour.
-* Wire `Gradient` into the rail or drop it.
-
----------------------------------------------------------------------------------------------------
+### 7.0 Bug-report triage (owner's report, v10 testing) — where each item is handled
+**Done in v11 (Round 1):** Save As after Undo/History/Recent/without edits (+ format choice, quality, resize) · toasts for save/copy/paste/open/recent/reset · file-name box overwritten by tools · name box focus/highlight · Reset = undoable step · opening Recent resets the document · Recent list updates + long names · MenuButton look (Recent/Tabs/Settings) · "Show tooltips" · "Default AI model" · lingering blue button highlight · Paperize stacking after Undo · restore settings when going back in History · sliders swallowing vertical scroll.
+**Planned — Round 2 (Shell v2):** square popover corners (CSS done, needs compositor check) · presets popup rework (small text, white theme) · toolbox = ONE scrollable column · compare/preview slider scaling (halftone/ASCII output size vs original) and compare modes (Settings: previous step / before this tool / original) · image goes black when zoomed in (Cairo limit — draw only the visible part) · tool-name consistency (toolbar vs inspector title, "Palet", "(…)" in Paperize, Watermark shows "Gradient") · remove the small preview in Remove · eyedropper "magnifying glass" confusion · custom colour picker + global primary/secondary colours with expandable palette generator · docked, collapsible, fixed-size panels (no resize handles; reset on restart) · minimal Layers panel (image + toggleable mask overlay).
+**Planned — Round 3 (Engine v2: Rust, alpha-aware):** Adjust (brightness/contrast/vignette must not touch alpha; **saturation bug = ImageMagick `-modulate` hue sent as 0 instead of 100**; warmth far too weak) · Pixelate lag above 50 · Outline lag on thick outlines (use the EDT in `paperize.rs`) and rename "Smoothness"→"Blur" · Fill Background (blur-original always white; stray 🔍) · Halftone (lines vs dots identical, shape ignored in lines mode, backgrounds must only colour the subject not transparent pixels, output size vs original) · ASCII (lag at large widths → render in-process with cairo/pango, remove/repurpose font size, brightness −100 vanishing, shared Background function) · Gradient rewrite (linear angle really rotates the gradient, colour ratio/stops 60/40, offset x/y, size as numeric inputs with ratio lock, "background for current image" = image size, radial centred, remove useless angle slider) · shared Background function for Halftone/ASCII/Paperize/Outline/Fill · **transparency audit with a test per tool** · Convert tool removed (now Save As).
+**Planned — Round 4 (Tools v2):** Crop (aspect-ratio presets Free/1:1/4:3/3:2/16:9/4:5/5:4/9:16/3:4/2:3 + custom + portrait/landscape flip; **phone-gallery style live rotate** with cut-off corners darkened; crop box must not flash/reset when clicking the same pixel and stays dimmed while active; resize removed from Crop or given a ratio lock) · Paperize v3 (remove Background option; paper colour must also colour the torn rim/edges; weathering only on the subject; **"cutout/scissors" mode with straight-ish edges** replacing the bitey "torn photo edges"; canvas **grows** (owner decision); the weird transparent margin/harsh expansion) · Watermark (tab title bug, **text-only rich text box** with per-selection font/bold/italic via GtkTextView tags + Pango render; saves its content in presets).
+**Planned — Round 5 (AI v2):** §5.14.
+**Planned — Round 6 (Projects & files):** projects = folders, project file (`.ftproj` zip: manifest + original + steps/params + thumbnail), session restore.
+**Planned — Round 7:** recipes + batch + drag-and-drop. **Round 8:** PDF workspace (qpdf + pdftoppm; page grid, reorder, extract, merge, split, rotate; later OCR/compress/protect).
+**Owner decisions on record:** rotate = phone-gallery style · Paperize on opaque photos grows the canvas · docked fixed-size panels, no draggable resizing · global primary/secondary colours (+ expandable palette generator) · compare modes in Settings · AI object recognition > masking UI polish; Rust ONNX, models downloadable, silueta default and the others in the list · watermark = text only · MIT licence · system ONNX Runtime package OK (document in README).
 
 ## 8. CLEANUP / THINGS TO CHANGE (do when touching the area)
 * `menus::install` still returns an unused `PopoverMenuBar` (menu bar was removed from the window); keep the actions, drop the widget code when convenient. `rail_group_headers/rail_group_tabs` fields are unused now.
@@ -290,6 +284,7 @@ loading another PDF; batch load. Implement with `qpdf` + `pdftoppm`. Extras by p
 * Scope target for editing = "paint.net-lite", not Krita/GIMP.
 
 ## 12. Changelog
+* **v11** — Round 1 "Core v2": `current_head()` truth, Save As dialog + `export.rs`, undoable Reset, `open_path`, Recent popover, toasts, name box rules, `sync_tool_inputs` (+ `HistoryEntry.tool`, settings restore), focus-clearing, tooltip + default-model settings, slider scroll, button look, MIT `LICENSE`, expanded NOTES (AI plan, README list, triage, next-AI guide).
 * **v10** — menu bar removed; icon-only toolbox with 3 sizes; zoom controls in the status bar; Recent button; Crop rebuilt (single-purpose actions, no Process button); fade slider = true crossfade and shown for all effect tools;
   Paperize border follows the subject silhouette (EDT) + crumple; transparent PNG/WebP clean-up (`sanitize_transparency`, `@clean-alpha`); History panel explicit colours; toolbox_size setting.
 * **v9** — UI shell: menu bar (File/Edit/View/Tools/Help, shortcuts, Open Recent), big icon toolbar with Undo/Redo, History dock with click-to-rollback (future steps dimmed), status bar
@@ -300,3 +295,22 @@ loading another PDF; batch load. Implement with `qpdf` + `pdftoppm`. Extras by p
 * **v5** — sound moved to Settings; halftone/ASCII bases; ASCII un-stretch; themes renamed (dark/black) + monochrome accents; Adjust proxy preview.
 * **v4** — halftone/ASCII overlay; CPU-capped builds; NOTES.
 * **v3** — theme rewrite; popover closing; CLI open. **v2** — OLED theme, launcher, perf fixes.
+
+---------------------------------------------------------------------------------------------------
+
+## 13. HOW TO BRIEF THE NEXT AI (and the prompt to use right now)
+
+**Rule for every AI that finishes a round:** before handing over, (1) update §6 Status, §7.0/roadmap statuses and §12 Changelog, (2) rewrite the block below so the *next* AI knows exactly what to do, (3) put a one-paragraph summary of what you could **not** verify.
+**How to build the next prompt:** state the round name from §7, list the concrete items (copy from §7.0), name the files likely involved, repeat the constraints that matter for that round (§2), say how to verify (§3), and say what the owner should test. Keep it under ~25 lines.
+
+### CURRENT NEXT PROMPT (paste into a new chat with the zip attached)
+```
+Read NOTES.md fully (especially §0, §2, §5.13, §7). Next is ROUND 2 — "Shell v2" (paint.net-style UI polish), items listed under
+"Planned — Round 2" in §7.0. Do not touch the engine/tool internals except where an item requires it.
+Key decisions: toolbox = ONE scrollable column (3 sizes already exist; remove the 2-column grid), docked collapsible panels with FIXED sizes (no drag handles),
+custom colour picker + global primary/secondary colours with an expandable palette generator, a canvas rewrite that draws only the visible region
+(fixes the black image when zoomed in) and scales original/result to the same rect (fixes the compare slider), compare modes in Settings,
+consistent tool names everywhere (see list in §7.0), remove the small preview in the Remove tab, rework the Presets popover (readable in the white theme).
+Verify with tools/shot.sh + tools/interact.sh in dark AND light themes; run cargo test; deliver one zip; then update NOTES.md (§6, §7.0, §12, §13).
+Before coding, reply in <=10 lines with your understanding and wait for "go".
+```

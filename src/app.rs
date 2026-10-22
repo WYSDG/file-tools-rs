@@ -82,6 +82,8 @@ pub struct HistoryEntry {
     pub output_path: PathBuf,
     /// The tool's control values when this step was produced (same format as presets).
     pub params: serde_json::Value,
+    /// Tab (tool) that produced this step, used to give that tool the right input after Undo.
+    pub tool: String,
     /// Produced by a live-preview run. Consecutive live runs of the same tool collapse into one
     /// step; explicit "Process" clicks always start a new step.
     pub live: bool,
@@ -124,6 +126,14 @@ pub struct AppState {
     pub ui_refs: Rc<RefCell<Option<UiRefs>>>,
     /// File > Open Recent submenu.
     pub recent_menu: Rc<RefCell<Option<gtk::gio::Menu>>>,
+    /// True once the owner typed their own file name (tools then stop overwriting it).
+    pub name_edited: Rc<std::cell::Cell<bool>>,
+    pub name_guard: Rc<std::cell::Cell<bool>>,
+    pub toast_ui: Rc<RefCell<Option<Rc<crate::toast::Toast>>>>,
+    /// Tab name -> its BaseTab (to restore a step's settings).
+    pub tab_bases: Rc<RefCell<HashMap<String, crate::tabs::base::BaseTab>>>,
+    /// Called when the "default AI model" setting changes.
+    pub on_default_model: Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>,
 }
 
 #[derive(Clone)]
@@ -197,7 +207,7 @@ impl AppState {
         }
     }
 
-    fn current_head(&self) -> Option<PathBuf> {
+    pub fn current_head(&self) -> Option<PathBuf> {
         self.history
             .borrow()
             .last()
@@ -369,6 +379,7 @@ impl AppState {
                 label: label.to_string(),
                 output_path: output.clone(),
                 params,
+                tool: self.active_tab_name.borrow().clone(),
                 live,
             });
         }
@@ -398,7 +409,11 @@ impl AppState {
             .extension()
             .map(|e| e.to_string_lossy().to_string())
             .unwrap_or_else(|| "png".to_string());
-        self.fname.set_text(&format!("{}_{}.{}", stem, label, ext));
+        if label == "Reset" {
+            self.set_name_auto(&format!("{}.{}", stem, ext));
+        } else {
+            self.set_name_auto(&format!("{}_{}.{}", stem, label, ext));
+        }
 
         if let Ok((w, h)) = crate::util::image_dimensions(&output) {
             self.info_lbl
@@ -477,13 +492,13 @@ impl AppState {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    self.fname.set_text(&name);
-                    self.broadcast_input(Some(p), false);
+                    self.set_name_auto(&name);
+                    self.sync_tool_inputs();
                 }
                 None => {
                     self.preview.clear_result();
-                    self.fname.set_text("");
-                    self.broadcast_input(None, false);
+                    self.set_name_auto("");
+                    self.sync_tool_inputs();
                 }
             }
             if let Some(s) = self.fade_slider.borrow().as_ref() {
@@ -510,8 +525,12 @@ impl AppState {
                 .extension()
                 .map(|e| e.to_string_lossy().to_string())
                 .unwrap_or_else(|| "png".to_string());
-            self.fname.set_text(&format!("{}_{}.{}", stem, label, ext));
-            self.broadcast_input(Some(head), false);
+            if label == "Reset" {
+            self.set_name_auto(&format!("{}.{}", stem, ext));
+        } else {
+            self.set_name_auto(&format!("{}_{}.{}", stem, label, ext));
+        }
+            self.sync_tool_inputs();
         }
         self.refresh_strip();
     }
@@ -532,7 +551,7 @@ impl AppState {
         if let Some(s) = self.fade_slider.borrow().as_ref() {
             s.set_value(100.0);
         }
-        self.broadcast_input(Some(head), false);
+        self.sync_tool_inputs();
         self.refresh_strip();
     }
 
@@ -545,6 +564,8 @@ impl AppState {
         self.drop_pending();
         // Clear colours hidden under transparent PNG/WebP pixels so no tool "sees" them.
         let path = path.map(|p| crate::util::sanitize_transparency(&p).unwrap_or(p));
+        self.redo_stack.borrow_mut().clear();
+        self.name_edited.set(false);
         *self.initial_load.borrow_mut() = path.clone();
         self.history.borrow_mut().clear();
         *self.current_result.borrow_mut() = None;
@@ -557,7 +578,7 @@ impl AppState {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                self.fname.set_text(&name);
+                self.set_name_auto(&name);
                 if let Ok((w, h)) = crate::util::image_dimensions(p) {
                     self.info_lbl.set_text(&format!("{}  •  {}×{}", name, w, h));
                 } else {
@@ -566,7 +587,7 @@ impl AppState {
             }
             None => {
                 self.info_lbl.set_text("No image loaded");
-                self.fname.set_text("");
+                self.set_name_auto("");
             }
         }
 
@@ -585,11 +606,16 @@ impl AppState {
         let clipboard = display.clipboard();
         let app = self.clone();
         clipboard.read_texture_async(gtk::gio::Cancellable::NONE, move |res| {
-            let Ok(maybe_tex) = res else { return };
-            let Some(texture) = maybe_tex else { return };
+            let Some(texture) = res.ok().flatten() else {
+                app.toast("The clipboard doesn't contain an image.");
+                return;
+            };
             let path = config::tmp_file(".png");
             if texture.save_to_png(&path).is_ok() {
                 app.set_universal_input(Some(path));
+                app.toast("Pasted the image from the clipboard.");
+            } else {
+                app.toast("Couldn't read the image from the clipboard.");
             }
         });
     }
@@ -606,21 +632,14 @@ impl AppState {
 
     pub fn copy_result_image(&self) {
         self.flush_pending();
-        let src = self
-            .current_result
-            .borrow()
-            .clone()
-            .or_else(|| self.initial_load.borrow().clone());
-        let Some(src) = src else {
-            self.info_lbl
-                .set_text("Nothing to copy — load or process an image first");
+        let Some(src) = self.current_head() else {
+            self.toast("Nothing to copy: open an image first.");
             return;
         };
         if crate::util::copy_image_to_clipboard(&src) {
-            self.info_lbl.set_text("✓ Image copied to clipboard");
+            self.toast("Image copied to the clipboard.");
         } else {
-            self.info_lbl
-                .set_text("Copy failed — is wl-clipboard installed?");
+            self.toast("Copy failed. Is wl-clipboard installed?");
         }
     }
 
@@ -652,59 +671,105 @@ impl AppState {
             .unwrap_or_else(|| (config::save_dir(), "Processed".to_string()))
     }
 
+    /// Ctrl+S / Save As button: opens the Save As dialog for the *current* image.
     pub fn save_as(&self) {
         self.flush_pending();
-        let Some(result) = self.current_result.borrow().clone() else {
+        let parent = self.fname.root().and_then(|r| r.downcast::<gtk::Window>().ok());
+        match parent {
+            Some(w) => crate::save_dialog::show(self, &w),
+            None => self.toast("Can't open the Save dialog yet."),
+        }
+    }
+
+    /// Keep the file-name box in sync with the pipeline, unless the owner typed their own name.
+    pub fn set_name_auto(&self, text: &str) {
+        if self.name_edited.get() {
+            return;
+        }
+        self.name_guard.set(true);
+        self.fname.set_text(text);
+        self.name_guard.set(false);
+    }
+
+    pub fn toast(&self, msg: &str) {
+        if let Some(t) = self.toast_ui.borrow().as_ref() {
+            t.say(msg);
+        }
+    }
+
+    pub fn toast_actions(&self, msg: &str, actions: Vec<(String, Rc<dyn Fn()>)>, secs: u32) {
+        if let Some(t) = self.toast_ui.borrow().as_ref() {
+            t.show(msg, actions, secs);
+        }
+    }
+
+    /// Open any image as a new document (Open, Recent, Paste, CLI): history and redo are reset.
+    pub fn open_path(&self, path: PathBuf) {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        self.set_universal_input(Some(path));
+        self.toast(&format!("Opened {}", name));
+    }
+
+    /// Reset button: go back to the original image *as an undoable step* (Ctrl+Z brings the edits back).
+    pub fn reset_to_original(&self) {
+        self.drop_pending();
+        let Some(orig) = self.initial_load.borrow().clone() else {
+            self.toast("Open an image first.");
             return;
         };
-        let (_tab_dir, action) = self.current_meta();
-        let settings = self.settings.borrow().clone();
-        let save_dir = settings.effective_output_dir();
+        let already = self
+            .history
+            .borrow()
+            .last()
+            .map(|e| e.output_path == orig)
+            .unwrap_or(true);
+        if already {
+            self.toast("Already at the original image.");
+            return;
+        }
+        self.commit_step("Reset", orig, serde_json::Value::Null, false);
+        self.toast("Reset to the original. Ctrl+Z brings your edits back.");
+    }
 
-        let fname_text = self.fname.text().to_string();
-        let name = if fname_text.trim().is_empty() {
-            let stem = self
-                .initial_load
-                .borrow()
-                .as_ref()
-                .and_then(|p| p.file_stem())
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "output".to_string());
-            let ext = result
-                .extension()
-                .map(|e| e.to_string_lossy().to_string())
-                .unwrap_or_else(|| "png".to_string());
-            format!("{}_{}.{}", stem, action, ext)
-        } else {
-            fname_text.trim().to_string()
-        };
-
-        let _ = std::fs::create_dir_all(&save_dir);
-        let dst = save_dir.join(&name);
-
-        let data = match std::fs::read(&result) {
-            Ok(d) => d,
-            Err(e) => {
-                self.info_lbl.set_text(&format!("Save failed: {}", e));
-                return;
+    /// After Undo / Redo / History navigation: give every tool the right input, and let the
+    /// active tool edit the step now at the head (so a tool never re-applies itself on its own output).
+    fn sync_tool_inputs(&self) {
+        let (head, step_input, head_step) = {
+            let hist = self.history.borrow();
+            let head = hist
+                .last()
+                .map(|e| e.output_path.clone())
+                .or_else(|| self.initial_load.borrow().clone());
+            match hist.last() {
+                Some(e) => {
+                    let prev = if hist.len() >= 2 {
+                        Some(hist[hist.len() - 2].output_path.clone())
+                    } else {
+                        self.initial_load.borrow().clone()
+                    };
+                    (head, prev, Some((e.tool.clone(), e.params.clone())))
+                }
+                None => (head, None, None),
             }
         };
-        if let Err(e) = std::fs::write(&dst, &data) {
-            self.info_lbl.set_text(&format!("Save failed: {}", e));
-            return;
+        let active = self.active_tab_name.borrow().clone();
+        let display = head.as_ref().map(|p| self.friendly_name(p));
+        let editing_head = head_step.as_ref().map(|(t, _)| *t == active).unwrap_or(false);
+        for (name, cb) in self.input_listeners.borrow().iter() {
+            if editing_head && *name == active {
+                cb(step_input.clone(), display.clone());
+            } else {
+                cb(head.clone(), display.clone());
+            }
         }
-
-        if let Some(args) = settings.exiftool_args() {
-            let mut cmd = std::process::Command::new("exiftool");
-            cmd.args(&args);
-            cmd.arg(dst.to_string_lossy().as_ref());
-            let _ = cmd.output();
+        // Restore the controls to what that step used (without re-rendering).
+        if let Some((tool, params)) = head_step {
+            if tool == active && !params.is_null() {
+                if let Some(b) = self.tab_bases.borrow().get(&active) {
+                    b.apply_preset_quiet(&params);
+                }
+            }
         }
-
-        *self.current_result.borrow_mut() = Some(dst.clone());
-        self.info_lbl
-            .set_text(&format!("Saved → {}", dst.display()));
-        self.refresh_history();
     }
 
     pub fn refresh_history(&self) {
@@ -819,7 +884,7 @@ pub fn open_image_dialog(app: &AppState, parent: Option<gtk::Window>) {
     dialog.open(parent.as_ref(), gtk::gio::Cancellable::NONE, move |res| {
         if let Ok(file) = res {
             if let Some(path) = file.path() {
-                app_inner.set_universal_input(Some(path));
+                app_inner.open_path(path);
             }
         }
     });
@@ -838,6 +903,15 @@ fn big_content(icon_key: &str, label: &str) -> GtkBox {
     l.add_css_class("caption");
     bx.append(&l);
     bx
+}
+
+/// Give a MenuButton's inner button the same look as the other toolbar buttons.
+fn style_menu_button(mb: &gtk::MenuButton) {
+    mb.remove_css_class("flat");
+    if let Some(inner) = mb.first_child() {
+        inner.remove_css_class("flat");
+        inner.add_css_class("tool-btn");
+    }
 }
 
 fn big_button(icon_key: &str, label: &str, tip: &str) -> Button {
@@ -887,6 +961,11 @@ fn build_ui(app: &Application) {
         step_list: Rc::new(RefCell::new(None)),
         ui_refs: Rc::new(RefCell::new(None)),
         recent_menu: Rc::new(RefCell::new(None)),
+        name_edited: Rc::new(std::cell::Cell::new(false)),
+        name_guard: Rc::new(std::cell::Cell::new(false)),
+        toast_ui: Rc::new(RefCell::new(None)),
+        tab_bases: Rc::new(RefCell::new(HashMap::new())),
+        on_default_model: Rc::new(RefCell::new(None)),
         history_list: Rc::new(RefCell::new(None)),
         fade_box: Rc::new(RefCell::new(None)),
         fade_slider: Rc::new(RefCell::new(None)),
@@ -961,6 +1040,13 @@ fn build_ui(app: &Application) {
     {
         let t = RemoveTab::new(app_state.clone());
         register_page!("Remove", t.base.inspector);
+        app_state.tab_bases.borrow_mut().insert("Remove".to_string(), t.base.clone());
+        // "Default AI model" from Settings: apply now and whenever it changes.
+        t.select_model_key(&app_state.settings.borrow().default_model);
+        {
+            let tm = t.clone();
+            *app_state.on_default_model.borrow_mut() = Some(Rc::new(move |key| tm.select_model_key(key)));
+        }
         let tc = t.clone();
         app_state.register_input_listener("Remove", Rc::new(move |p, d| tc.set_input(p, d)));
         let tc = t.clone();
@@ -980,6 +1066,7 @@ fn build_ui(app: &Application) {
     {
         let t = AdjustTab::new(app_state.clone());
         register_page!("Adjust", t.base.inspector);
+        app_state.tab_bases.borrow_mut().insert("Adjust".to_string(), t.base.clone());
         let b = t.base.clone();
         app_state.register_input_listener("Adjust", Rc::new(move |p, d| b.set_input(p, d)));
         let tc = t.clone();
@@ -1006,6 +1093,7 @@ fn build_ui(app: &Application) {
     {
         let t = CropTab::new(app_state.clone());
         register_page!("Crop", t.base.inspector);
+        app_state.tab_bases.borrow_mut().insert("Crop".to_string(), t.base.clone());
         let b = t.base.clone();
         app_state.register_input_listener("Crop", Rc::new(move |p, d| b.set_input(p, d)));
         let tc = t.clone();
@@ -1025,6 +1113,7 @@ fn build_ui(app: &Application) {
     {
         let t = Rc::new(ConvertTab::new(app_state.clone()));
         register_page!("Convert", t.base.inspector);
+        app_state.tab_bases.borrow_mut().insert("Convert".to_string(), t.base.clone());
         let b = t.base.clone();
         app_state.register_input_listener("Convert", Rc::new(move |p, d| b.set_input(p, d)));
         let tc = t.clone();
@@ -1044,6 +1133,7 @@ fn build_ui(app: &Application) {
     {
         let t = FillBgTab::new(app_state.clone());
         register_page!("Fill Background", t.base.inspector);
+        app_state.tab_bases.borrow_mut().insert("Fill Background".to_string(), t.base.clone());
         let b = t.base.clone();
         app_state
             .register_input_listener("Fill Background", Rc::new(move |p, d| b.set_input(p, d)));
@@ -1086,6 +1176,7 @@ fn build_ui(app: &Application) {
     {
         let t = HalftoneTab::new(app_state.clone());
         register_page!("Halftone", t.base.inspector);
+        app_state.tab_bases.borrow_mut().insert("Halftone".to_string(), t.base.clone());
         let b = t.base.clone();
         app_state.register_input_listener("Halftone", Rc::new(move |p, d| b.set_input(p, d)));
         let tc = t.clone();
@@ -1111,6 +1202,7 @@ fn build_ui(app: &Application) {
     {
         let t = DuotoneTab::new(app_state.clone());
         register_page!("Duotone", t.base.inspector);
+        app_state.tab_bases.borrow_mut().insert("Duotone".to_string(), t.base.clone());
         let b = t.base.clone();
         app_state.register_input_listener("Duotone", Rc::new(move |p, d| b.set_input(p, d)));
         let tc = t.clone();
@@ -1136,6 +1228,7 @@ fn build_ui(app: &Application) {
     {
         let t = AsciiTab::new(app_state.clone());
         register_page!("ASCII", t.base.inspector);
+        app_state.tab_bases.borrow_mut().insert("ASCII".to_string(), t.base.clone());
         let b = t.base.clone();
         app_state.register_input_listener("ASCII", Rc::new(move |p, d| b.set_input(p, d)));
         let tc = t.clone();
@@ -1163,6 +1256,7 @@ fn build_ui(app: &Application) {
     {
         let t = Rc::new(PixelateTab::new(app_state.clone()));
         register_page!("Pixelate", t.base.inspector);
+        app_state.tab_bases.borrow_mut().insert("Pixelate".to_string(), t.base.clone());
         let b = t.base.clone();
         app_state.register_input_listener("Pixelate", Rc::new(move |p, d| b.set_input(p, d)));
         let tc = t.clone();
@@ -1188,6 +1282,7 @@ fn build_ui(app: &Application) {
     {
         let t = Rc::new(PaperizeTab::new(app_state.clone()));
         register_page!("Paperize", t.base.inspector);
+        app_state.tab_bases.borrow_mut().insert("Paperize".to_string(), t.base.clone());
         let b = t.base.clone();
         app_state.register_input_listener("Paperize", Rc::new(move |p, d| b.set_input(p, d)));
         let tc = t.clone();
@@ -1213,6 +1308,7 @@ fn build_ui(app: &Application) {
     {
         let t = OutlineTab::new(app_state.clone());
         register_page!("Outline", t.base.inspector);
+        app_state.tab_bases.borrow_mut().insert("Outline".to_string(), t.base.clone());
         let b = t.base.clone();
         app_state.register_input_listener("Outline", Rc::new(move |p, d| b.set_input(p, d)));
         let tc = t.clone();
@@ -1238,6 +1334,7 @@ fn build_ui(app: &Application) {
     {
         let t = WatermarkTab::new(app_state.clone());
         register_page!("Watermark", t.base.inspector);
+        app_state.tab_bases.borrow_mut().insert("Watermark".to_string(), t.base.clone());
         let b = t.base.clone();
         app_state.register_input_listener("Watermark", Rc::new(move |p, d| b.set_input(p, d)));
         let tc = t.clone();
@@ -1437,8 +1534,6 @@ fn build_ui(app: &Application) {
     }
     top_bar.append(&choose_btn);
     let recent_btn = gtk::MenuButton::new();
-    recent_btn.add_css_class("tool-btn");
-    recent_btn.add_css_class("flat");
     recent_btn.set_tooltip_text(Some("Recently saved images"));
     recent_btn.set_child(Some(&big_content("recent", "Recent")));
     top_bar.append(&recent_btn);
@@ -1482,13 +1577,13 @@ fn build_ui(app: &Application) {
     let flush_btn = big_button("reset", "Reset", "Reset everything back to the original image");
     {
         let state = app_state.clone();
-        flush_btn.connect_clicked(move |_| state.clear_pipeline());
+        flush_btn.connect_clicked(move |_| state.reset_to_original());
     }
     top_bar.append(&flush_btn);
 
     let tabs_btn = gtk::MenuButton::new();
     tabs_btn.set_child(Some(&big_content("tools", "Tabs")));
-    tabs_btn.add_css_class("flat");
+    style_menu_button(&tabs_btn);
     tabs_btn.set_tooltip_text(Some("Show or hide tabs"));
     top_bar.append(&tabs_btn);
 
@@ -1568,7 +1663,7 @@ fn build_ui(app: &Application) {
 
     let gear_btn = gtk::MenuButton::new();
     gear_btn.set_child(Some(&big_content("settings", "Settings")));
-    gear_btn.add_css_class("flat");
+    style_menu_button(&gear_btn);
     gear_btn.set_tooltip_text(Some("Settings"));
     top_bar.append(&gear_btn);
     show_settings_popover(&gear_btn, app_state.clone());
@@ -1587,9 +1682,8 @@ fn build_ui(app: &Application) {
     // The menu bar is intentionally not shown (the toolbar covers it); its actions and keyboard
     // shortcuts stay registered, and "Recent" lives in the toolbar.
     let _menubar = menubar;
-    if let Some(m) = app_state.recent_menu.borrow().as_ref() {
-        recent_btn.set_menu_model(Some(m));
-    }
+    recent_btn.set_popover(Some(&crate::menus::build_recent_popover(&app_state)));
+    style_menu_button(&recent_btn);
     main.append(&top_bar);
 
     // Middle
@@ -1728,7 +1822,50 @@ fn build_ui(app: &Application) {
     });
     main.append(&status);
     app_state.refresh_strip();
-    window.set_child(Some(&main));
+    let toast = crate::toast::Toast::new();
+    *app_state.toast_ui.borrow_mut() = Some(toast.clone());
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&main));
+    overlay.add_overlay(toast.widget());
+    window.set_child(Some(&overlay));
+
+    // Clicking anywhere that isn't a text field drops keyboard focus, so buttons and the name box
+    // don't stay highlighted after you click away.
+    {
+        let click = gtk::GestureClick::new();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.set_button(0);
+        click.connect_pressed(move |g, _, x, y| {
+            let Some(w) = g.widget() else { return };
+            let mut cur = w.pick(x, y, gtk::PickFlags::DEFAULT);
+            while let Some(c) = cur {
+                if c.is::<gtk::Text>() || c.is::<gtk::TextView>() {
+                    return;
+                }
+                cur = c.parent();
+            }
+            gtk::glib::idle_add_local_once(move || {
+                if let Some(root) = w.root() {
+                    root.set_focus(None::<&gtk::Widget>);
+                }
+            });
+        });
+        window.add_controller(click);
+    }
+    {
+        let (edited, guard) = (app_state.name_edited.clone(), app_state.name_guard.clone());
+        app_state.fname.connect_changed(move |_| {
+            if !guard.get() {
+                edited.set(true);
+            }
+        });
+        app_state.fname.connect_activate(|e| {
+            if let Some(r) = e.root() {
+                r.set_focus(None::<&gtk::Widget>);
+            }
+        });
+    }
+
 
     // Apply initial layout — hide disabled tabs
     {
@@ -1804,6 +1941,8 @@ fn build_ui(app: &Application) {
     }
     window.add_controller(key_ctrl);
 
+    // Honour "Show tooltips" (applied once everything exists).
+    crate::settings_panel::apply_tooltips(window.upcast_ref::<gtk::Widget>(), app_state.settings.borrow().show_tooltips);
     window.present();
 
     if let Some(path) = INITIAL_FILE.get() {

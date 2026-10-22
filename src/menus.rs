@@ -91,7 +91,7 @@ pub fn install(
     }
     {
         let a = app.clone();
-        add_action(window, "reset", move || a.clear_pipeline());
+        add_action(window, "reset", move || a.reset_to_original());
     }
     {
         let a = app.clone();
@@ -155,7 +155,7 @@ pub fn install(
         string_action(window, "open_recent", move |path| {
             let p = PathBuf::from(path);
             if p.exists() {
-                a.set_universal_input(Some(p));
+                a.open_path(p);
             }
         });
     }
@@ -242,4 +242,85 @@ pub fn install(
     let bar = gtk::PopoverMenuBar::from_model(Some(&root));
     bar.add_css_class("menu-bar");
     bar
+}
+
+/// Popover list of recently saved images (names are ellipsized, so long names can't blow up the width).
+pub fn build_recent_popover(app: &AppState) -> gtk::Popover {
+    let popover = gtk::Popover::new();
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.set_activate_on_single_click(true);
+    let scroll = gtk::ScrolledWindow::builder()
+        .min_content_width(330)
+        .max_content_width(330)
+        .min_content_height(60)
+        .max_content_height(360)
+        .propagate_natural_height(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    scroll.set_child(Some(&list));
+    popover.set_child(Some(&scroll));
+
+    let paths: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
+    // Rebuilt every time it is shown, so new saves always appear.
+    {
+        let (list, paths) = (list.clone(), paths.clone());
+        popover.connect_map(move |_| {
+            while let Some(c) = list.first_child() {
+                list.remove(&c);
+            }
+            let mut files: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(config::save_dir())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    let ext = p.extension()?.to_string_lossy().to_lowercase();
+                    if !e.file_type().ok()?.is_file() || !IMAGE_EXTS.contains(&ext.as_str()) {
+                        return None;
+                    }
+                    Some((e.metadata().ok()?.modified().ok()?, p))
+                })
+                .collect();
+            files.sort_by(|a, b| b.0.cmp(&a.0));
+            let mut stored = paths.borrow_mut();
+            stored.clear();
+            if files.is_empty() {
+                let l = gtk::Label::new(Some("No saved images yet"));
+                l.set_margin_top(10);
+                l.set_margin_bottom(10);
+                l.set_margin_start(14);
+                l.set_margin_end(14);
+                list.append(&l);
+            }
+            for (_, p) in files.into_iter().take(20) {
+                let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let l = gtk::Label::new(Some(&name));
+                l.set_xalign(0.0);
+                l.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+                l.set_width_chars(34);
+                l.set_max_width_chars(34);
+                l.set_margin_top(6);
+                l.set_margin_bottom(6);
+                l.set_margin_start(10);
+                l.set_margin_end(10);
+                l.set_tooltip_text(Some(&p.to_string_lossy()));
+                list.append(&l);
+                stored.push(p);
+            }
+        });
+    }
+    {
+        let (paths, app, pop) = (paths.clone(), app.clone(), popover.clone());
+        list.connect_row_activated(move |_, row| {
+            let idx = row.index();
+            if idx >= 0 {
+                if let Some(p) = paths.borrow().get(idx as usize).cloned() {
+                    pop.popdown();
+                    app.open_path(p);
+                }
+            }
+        });
+    }
+    popover
 }

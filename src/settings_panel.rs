@@ -23,6 +23,9 @@ pub struct Settings {
     pub theme_v: u32,
     /// Toolbox size: 0 = small (1 column), 1 = medium (2 columns), 2 = large (2 columns + names).
     pub toolbox_size: u32,
+    /// Last used Save As format (0 PNG, 1 JPEG, 2 WebP) and quality (1..=100).
+    pub save_format: u32,
+    pub save_quality: u32,
 }
 
 impl Default for Settings {
@@ -42,6 +45,8 @@ impl Default for Settings {
             theme: "blue".to_string(),
             theme_v: 2,
             toolbox_size: 1,
+            save_format: 0,
+            save_quality: 100,
         }
     }
 }
@@ -216,6 +221,26 @@ pub fn palette(theme: &str) -> Palette {
 
 /// Make GTK's own widgets (buttons, entries, dropdowns, scrollbars…) use the
 /// light or dark variant that matches the chosen theme, regardless of the system theme.
+/// Turn every tooltip below `root` on or off (GTK4 has no global switch for this).
+pub fn apply_tooltips(root: &gtk::Widget, on: bool) {
+    fn walk(w: &gtk::Widget, on: bool) {
+        if w.tooltip_text().is_some() || w.tooltip_markup().is_some() {
+            w.set_has_tooltip(on);
+        }
+        if let Some(mb) = w.downcast_ref::<gtk::MenuButton>() {
+            if let Some(p) = mb.popover() {
+                walk(p.upcast_ref(), on);
+            }
+        }
+        let mut child = w.first_child();
+        while let Some(c) = child {
+            walk(&c, on);
+            child = c.next_sibling();
+        }
+    }
+    walk(root, on);
+}
+
 pub fn apply_color_scheme(theme: &str) {
     if let Some(settings) = gtk::Settings::default() {
         settings.set_property("gtk-application-prefer-dark-theme", palette(theme).dark);
@@ -309,6 +334,15 @@ flowboxchild { padding: 0; background: none; }
 }
 .tool-btn { border-radius: 6px; padding: 3px 8px; min-width: 52px; }
 .status-zoom button { min-height: 20px; padding: 0 8px; }
+.toast { background-color: $bg_soft; color: $fg; border: 1px solid $border; border-radius: 12px; padding: 8px 14px; box-shadow: 0 6px 18px rgba(0,0,0,0.35); }
+.toast label { color: $fg; }
+.toast-btn { padding: 2px 10px; min-height: 24px; }
+/* no lingering keyboard-focus highlight on buttons */
+button:focus, button:focus-visible, togglebutton:focus, togglebutton:focus-visible,
+menubutton:focus, menubutton > button:focus-visible { outline: none; box-shadow: none; }
+/* rounded popovers without the extra square behind them */
+popover.background { background: none; background-color: transparent; box-shadow: none; border: none; }
+popover.background > contents { background-color: $bg_soft; border: 1px solid $border; border-radius: 12px; box-shadow: 0 6px 20px rgba(0,0,0,0.35); }
 .status-zoom label { padding: 0 6px; }
 .status-bar { background-color: $bg_soft; border-top: 1px solid $border; padding: 3px 4px; font-size: 0.9em; }
 menubar { background-color: $bg_soft; border-bottom: 1px solid $border; }
@@ -612,6 +646,9 @@ pub fn show_settings_popover(parent: &gtk::MenuButton, app: crate::app::AppState
             if let Some(m) = models.get(dd.selected() as usize) {
                 app_c.settings.borrow_mut().default_model = m.to_string();
                 app_c.settings.borrow().save();
+                if let Some(f) = app_c.on_default_model.borrow().as_ref() {
+                    f(m);
+                }
             }
         });
     }
@@ -641,6 +678,9 @@ pub fn show_settings_popover(parent: &gtk::MenuButton, app: crate::app::AppState
         tip_cb.connect_toggled(move |c| {
             app_c.settings.borrow_mut().show_tooltips = c.is_active();
             app_c.settings.borrow().save();
+            if let Some(root) = app_c.fname.root() {
+                apply_tooltips(root.upcast_ref::<gtk::Widget>(), c.is_active());
+            }
         });
     }
 

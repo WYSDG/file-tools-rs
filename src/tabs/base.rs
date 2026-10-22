@@ -25,6 +25,8 @@ pub type RustJob = Box<dyn FnOnce(&std::path::Path, f64) -> Result<PathBuf, Stri
 pub struct BaseTab {
     /// The full right-side inspector content (header + controls + process + status).
     pub inspector: gtk::Box,
+    /// While true, control changes do not schedule live previews (used when restoring a step's settings).
+    pub suppress_live: Rc<Cell<bool>>,
     pub controls: gtk::Box,
     pub status_lbl: gtk::Label,
     pub spinner: gtk::Spinner,
@@ -136,6 +138,7 @@ impl BaseTab {
             live_trigger: Rc::new(RefCell::new(None)),
             live_timer: Rc::new(RefCell::new(None)),
             processing: Rc::new(Cell::new(false)),
+            suppress_live: Rc::new(Cell::new(false)),
         };
 
         // ---- Presets popover ----
@@ -334,6 +337,13 @@ impl BaseTab {
         serde_json::Value::Object(map)
     }
 
+    /// Restore saved settings without triggering a re-render.
+    pub fn apply_preset_quiet(&self, data: &serde_json::Value) {
+        self.suppress_live.set(true);
+        self.apply_preset_data(data);
+        self.suppress_live.set(false);
+    }
+
     pub fn apply_preset_data(&self, data: &serde_json::Value) {
         let Some(map) = data.as_object() else { return };
         for (name, w) in self.preset_widgets.borrow().iter() {
@@ -392,6 +402,9 @@ impl BaseTab {
         }));
     }
     pub fn schedule_live_process(&self) {
+        if self.suppress_live.get() {
+            return;
+        }
         Self::schedule_impl(
             &self.live_preview,
             &self.live_timer,
@@ -575,6 +588,29 @@ impl BaseTab {
         let s = gtk::Scale::with_range(gtk::Orientation::Horizontal, lo, hi, 1.0);
         s.set_value(default);
         s.set_round_digits(0);
+
+        // A plain scroll over a slider scrolls the page instead of moving the slider (Ctrl+scroll
+        // still adjusts it). Otherwise a trackpad swipe over a slider gets "stuck" on it.
+        {
+            let sc = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+            sc.set_propagation_phase(gtk::PropagationPhase::Capture);
+            sc.connect_scroll(|ctrl, _dx, dy| {
+                if ctrl.current_event_state().contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+                    return gtk::glib::Propagation::Proceed;
+                }
+                if let Some(w) = ctrl.widget() {
+                    if let Some(sw) = w
+                        .ancestor(gtk::ScrolledWindow::static_type())
+                        .and_then(|a| a.downcast::<gtk::ScrolledWindow>().ok())
+                    {
+                        let adj = sw.vadjustment();
+                        adj.set_value(adj.value() + dy * adj.step_increment().max(24.0));
+                    }
+                }
+                gtk::glib::Propagation::Stop
+            });
+            s.add_controller(sc);
+        }
 
         let lbl_c = lbl.clone();
         let sc_c = s.clone();

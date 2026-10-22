@@ -232,6 +232,13 @@ impl RemoveTab {
         }
     }
 
+    /// Select the AI model by its key (e.g. "silueta"); used for the "default AI model" setting.
+    pub fn select_model_key(&self, key: &str) {
+        if let Some(i) = MODELS.iter().position(|(_, k)| *k == key) {
+            self.model.set_selected(i as u32);
+        }
+    }
+
     pub fn run(self: &Rc<Self>, app: &AppState) {
         let Some(input) = self.base.get_input() else {
             self.base.set_status("Load an image first", true);
